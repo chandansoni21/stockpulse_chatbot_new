@@ -1,0 +1,10 @@
+{
+  "agents": [
+    {
+      "id": "stock-pulse",
+      "name": "Stock Pulse Agent",
+      "description": "SKU, stock, store inventory and barcode data",
+      "data_agent_url": "https://api.fabric.microsoft.com/v1/workspaces/f86b0adb-cc7d-4466-85ea-b94d20e7926a/dataagents/e1534133-1784-4553-946f-7d32857afc5d/aiassistant/openai"
+    }
+  ]
+}
