@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -15,12 +16,30 @@ CACHE_NAME = "fabric-stock-pulse-msal-cache"
 _credential: Optional[InteractiveBrowserCredential] = None
 
 
-def _session_payload() -> dict:
+def _email_from_token(token_str: str) -> Optional[str]:
+    try:
+        payload = token_str.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return (
+            claims.get("preferred_username")
+            or claims.get("upn")
+            or claims.get("email")
+            or claims.get("unique_name")
+        )
+    except (IndexError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def _session_payload(user_email: Optional[str] = None) -> dict:
     now = time.time()
-    return {
+    payload = {
         "authenticated_at": now,
         "expires_at": now + (SESSION_DAYS * 24 * 60 * 60),
     }
+    if user_email:
+        payload["user_email"] = user_email
+    return payload
 
 
 def get_credential() -> InteractiveBrowserCredential:
@@ -49,10 +68,25 @@ def is_session_valid() -> bool:
     return time.time() < float(session.get("expires_at", 0))
 
 
-def save_session() -> dict:
-    payload = _session_payload()
+def save_session(user_email: Optional[str] = None) -> dict:
+    payload = _session_payload(user_email=user_email)
     SESSION_FILE.write_text(json.dumps(payload), encoding="utf-8")
     return payload
+
+
+def _resolve_user_email(session: dict) -> Optional[str]:
+    email = session.get("user_email")
+    if email:
+        return email
+    try:
+        token = get_credential().get_token(FABRIC_SCOPE)
+        email = _email_from_token(token.token)
+        if email:
+            session["user_email"] = email
+            SESSION_FILE.write_text(json.dumps(session), encoding="utf-8")
+        return email
+    except Exception:
+        return None
 
 
 def clear_session() -> None:
@@ -83,6 +117,7 @@ def get_auth_status() -> dict:
         "authenticated": True,
         "expires_at": session.get("expires_at"),
         "session_days": SESSION_DAYS,
+        "user_email": _resolve_user_email(session),
     }
 
 
@@ -94,12 +129,14 @@ def acquire_fabric_token():
 
 def login_interactive() -> dict:
     token = get_credential().get_token(FABRIC_SCOPE)
-    session = save_session()
+    user_email = _email_from_token(token.token)
+    session = save_session(user_email=user_email)
     return {
         "authenticated": True,
         "expires_at": session["expires_at"],
         "token_expires_at": token.expires_on,
         "session_days": SESSION_DAYS,
+        "user_email": user_email,
     }
 
 
