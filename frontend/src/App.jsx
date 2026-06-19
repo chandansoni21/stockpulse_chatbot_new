@@ -3,7 +3,7 @@ import AgentSelector from './components/AgentSelector';
 import AppLogo from './components/AppLogo';
 import ChatBubble from './components/ChatBubble';
 import ChatInput from './components/ChatInput';
-import LogOutIcon from './components/LogOutIcon';
+import UserProfileMenu from './components/UserProfileMenu';
 import SignInModal from './components/SignInModal';
 import { useSpeechToText } from './hooks/useSpeechToText';
 import {
@@ -36,6 +36,7 @@ function getSessionId() {
 
 function App({
   authenticated = false,
+  userEmail = null,
   onLogin,
   loginLoading = false,
   loginError = null,
@@ -331,15 +332,7 @@ function App({
               <span className="hidden sm:inline">New chat</span>
             </button>
             {authenticated && (
-              <button
-                type="button"
-                onClick={handleLogout}
-                aria-label="Sign out"
-                title="Sign out"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600 sm:h-9 sm:w-9"
-              >
-                <LogOutIcon className="h-4 w-4 sm:h-[18px] sm:w-[18px]" />
-              </button>
+              <UserProfileMenu email={userEmail} onSignOut={handleLogout} />
             )}
           </div>
         </div>

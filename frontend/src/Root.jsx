@@ -6,6 +6,7 @@ import { API_URL } from './utils/apiConfig';
 function Root() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
+  const [userEmail, setUserEmail] = useState(null);
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState(null);
   const [sessionDays, setSessionDays] = useState(7);
@@ -15,10 +16,12 @@ function Root() {
     if (data?.authenticated) {
       setAuthExpires(data.expires_at);
       setAuthenticated(true);
+      setUserEmail(data.user_email || null);
       setLoginError(null);
     } else {
       clearAuthExpires();
       setAuthenticated(false);
+      setUserEmail(null);
     }
   }, []);
 
@@ -84,12 +87,14 @@ function Root() {
     }
     clearAuthExpires();
     setAuthenticated(false);
+    setUserEmail(null);
     setLoginError(null);
   }, []);
 
   const handleSessionExpired = useCallback(() => {
     clearAuthExpires();
     setAuthenticated(false);
+    setUserEmail(null);
     setLoginError(null);
   }, []);
 
@@ -104,6 +109,7 @@ function Root() {
   return (
     <App
       authenticated={authenticated}
+      userEmail={userEmail}
       onLogin={handleLogin}
       loginLoading={loginLoading}
       loginError={loginError}
