@@ -5,7 +5,11 @@ export function getStoredAgentId() {
 }
 
 export function setStoredAgentId(agentId) {
-  sessionStorage.setItem(AGENT_KEY, agentId);
+  if (agentId) {
+    sessionStorage.setItem(AGENT_KEY, agentId);
+  } else {
+    sessionStorage.removeItem(AGENT_KEY);
+  }
 }
 
 export function createWelcomeMessage(agentName) {

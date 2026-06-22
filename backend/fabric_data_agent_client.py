@@ -78,6 +78,7 @@ class FabricDataAgentClient:
         self.tenant_id = tenant_id
         self.data_agent_url = data_agent_url
         self.token = None
+        self.token_expires_on = 0
         
         # Validate inputs
         if not tenant_id:
@@ -102,10 +103,21 @@ class FabricDataAgentClient:
         try:
             logger.info("Refreshing authentication token...")
             self.token = acquire_fabric_token()
+            self.token_expires_on = self.token.expires_on
 
         except Exception as e:
             logger.error("Token refresh failed: %s", e)
             raise
+
+    def _ensure_fresh_token(self):
+        session_token = acquire_fabric_token()
+        if (
+            not self.token
+            or self.token.token != session_token.token
+            or self.token_expires_on <= (time.time() + 60)
+        ):
+            self.token = session_token
+            self.token_expires_on = session_token.expires_on
     
     def _get_openai_client(self, request_timeout: float = DEFAULT_TIMEOUT) -> OpenAI:
         """
@@ -114,8 +126,7 @@ class FabricDataAgentClient:
         Returns:
             OpenAI: Configured OpenAI client
         """
-        if not self.token or self.token.expires_on <= (time.time() + 300):
-            self._refresh_token()
+        self._ensure_fresh_token()
 
         if not self.token:
             raise ValueError("No valid authentication token available")
@@ -137,6 +148,35 @@ class FabricDataAgentClient:
             }
         )
 
+    @staticmethod
+    def is_fabric_access_error(message: str) -> bool:
+        lowered = str(message or "").lower()
+        return (
+            "itemnotfound" in lowered
+            or "error code: 404" in lowered
+            or "could not found the requested item" in lowered
+            or "does not have access to the fabric data agent" in lowered
+            or "couldn't reach the fabric data agent" in lowered
+        )
+
+    @staticmethod
+    def format_fabric_error(error: Exception | str, user_email: Optional[str] = None) -> str:
+        message = str(error).strip()
+        if FabricDataAgentClient.is_fabric_access_error(message):
+            return (
+                "I couldn't reach the Fabric Data Agent. The workspace or agent URL may be wrong, "
+                "or your account may not have access. Ask your administrator to verify backend/agents.json."
+            )
+        cleaned = message.removeprefix("Error:").strip()
+        return cleaned or "Something went wrong while contacting the data agent."
+
+    def _format_fabric_error(self, error: Exception, user_email: Optional[str] = None) -> str:
+        return self.format_fabric_error(error, user_email)
+
+    def _create_thread_via_openai(self, client: OpenAI, thread_name: str) -> dict:
+        thread = client.beta.threads.create(timeout=HTTP_REQUEST_TIMEOUT)
+        return {"id": thread.id, "name": thread_name}
+
     def _get_existing_or_create_new_thread(self, data_agent_url: str, thread_name = None) -> dict:
         """
         Get an existing thread or Create a new thread for the target Fabric Data Agent.
@@ -152,6 +192,8 @@ class FabricDataAgentClient:
             thread_name = f'external-client-thread-{uuid.uuid4()}'
         else:
             thread_name = thread_name # use provided thread name to attempt to get existing thread, if not create new thread
+
+        self._ensure_fresh_token()
         
         if "aiskills" in data_agent_url: # future proofing for different url formats
             base_url = data_agent_url.replace("aiskills", "dataagents").removesuffix("/openai").replace("/aiassistant","/__private/aiassistant")
@@ -168,6 +210,10 @@ class FabricDataAgentClient:
         }
 
         response = requests.get(get_new_thread_url, headers=headers, timeout=HTTP_REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            client = self._get_openai_client()
+            return self._create_thread_via_openai(client, thread_name)
+
         response.raise_for_status()
         thread = response.json()
         thread["name"] = thread_name #adding thread name to returned object
@@ -384,7 +430,7 @@ class FabricDataAgentClient:
             logger.error("Error calling data agent: %s", e)
             return {
                 "question": question,
-                "answer": f"Error: {e}",
+                "answer": self._format_fabric_error(e),
                 "run_status": "failed",
                 "reframed_query": None,
                 "sql_queries": [],
@@ -421,10 +467,10 @@ class FabricDataAgentClient:
                 preserve_thread=preserve_thread or bool(thread_name),
                 include_steps=False,
             )
-            return result["answer"]
+            return result["answer"] if not self.is_fabric_access_error(result["answer"]) else self._format_fabric_error(result["answer"])
         except Exception as e:
             logger.error("Error calling data agent: %s", e)
-            return f"Error: {e}"
+            return self._format_fabric_error(e)
     
     def get_run_details(self, question: str, thread_name=None, timeout: int = DEFAULT_TIMEOUT) -> dict:
         """
@@ -1098,6 +1144,23 @@ class FabricDataAgentClient:
                     sql_queries.append(clean_query)
         
         return sql_queries
+
+
+def is_fabric_access_error(message: str) -> bool:
+    return FabricDataAgentClient.is_fabric_access_error(message)
+
+
+def is_retryable_fabric_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return (
+        "itemnotfound" in lowered
+        or "error code: 404" in lowered
+        or "could not found the requested item" in lowered
+    )
+
+
+def format_fabric_error(error: Exception | str, user_email: Optional[str] = None) -> str:
+    return FabricDataAgentClient.format_fabric_error(error, user_email)
 
 
 def main(questions: list, raw_response: bool = False, thread_name = None):

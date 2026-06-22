@@ -1,7 +1,7 @@
 const PKCE_VERIFIER_KEY = 'fabric-pkce-verifier';
 const PKCE_STATE_KEY = 'fabric-pkce-state';
 
-const tenantId = import.meta.env.VITE_AZURE_TENANT_ID || 'aca0b239-69e9-4246-87ba-8e07ad0a9249';
+const tenantId = import.meta.env.VITE_AZURE_AUTHORITY || import.meta.env.VITE_AZURE_TENANT_ID || 'common';
 const clientId = import.meta.env.VITE_AZURE_CLIENT_ID || '04b07795-8ddb-461a-bbee-02f9e1bf7b46';
 const fabricScope = 'https://api.fabric.microsoft.com/.default';
 

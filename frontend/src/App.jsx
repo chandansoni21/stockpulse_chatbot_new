@@ -12,7 +12,9 @@ import {
   setStoredAgentId,
 } from './utils/agentStorage';
 import { fetchChatHistory, saveChatHistory } from './utils/chatHistoryApi';
-import { getLastTwoExchanges, suggestQuestionsFromContext } from './utils/suggestQuestions';
+import { fetchAgentSuggestions, fetchFollowupSuggestions } from './utils/agentSuggestionsApi';
+import { getLastTwoExchanges } from './utils/suggestQuestions';
+import { isFabricAccessMessage, normalizeAssistantText } from './utils/chatErrors';
 import { API_URL } from './utils/apiConfig';
 
 const REQUEST_TIMEOUT = 300;
@@ -50,6 +52,7 @@ function App({
   const pendingSubmitRef = useRef(null);
   const chatHydratedRef = useRef(false);
   const backendSessionIdRef = useRef(null);
+  const activeUserEmailRef = useRef(userEmail);
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId),
@@ -93,6 +96,38 @@ function App({
     }
   }, []);
 
+  const isWelcomeOnlyChat = useCallback((messageList) => {
+    return Array.isArray(messageList)
+      && messageList.length === 1
+      && messageList[0]?.role === 'assistant';
+  }, []);
+
+  const applyWelcomeSuggestions = useCallback(async (agentId, messageList) => {
+    if (!isWelcomeOnlyChat(messageList)) return;
+
+    setMessages((current) => {
+      if (!isWelcomeOnlyChat(current)) return current;
+      return [{ ...current[0], suggestions: [], suggestionsLoading: true }];
+    });
+
+    try {
+      const suggestions = await fetchAgentSuggestions(agentId);
+      setMessages((current) => {
+        if (!isWelcomeOnlyChat(current)) return current;
+        return [{
+          ...current[0],
+          suggestions: suggestions?.length ? suggestions : [],
+          suggestionsLoading: false,
+        }];
+      });
+    } catch {
+      setMessages((current) => {
+        if (!isWelcomeOnlyChat(current)) return current;
+        return [{ ...current[0], suggestionsLoading: false }];
+      });
+    }
+  }, [isWelcomeOnlyChat]);
+
   const loadAgents = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/agents`);
@@ -113,22 +148,36 @@ function App({
         const agentName = list.find((agent) => agent.id === initialId)?.name ?? DEFAULT_AGENTS[0].name;
         const restored = await loadHistoryForAgent(initialId, agentName);
         setMessages(restored);
+        applyWelcomeSuggestions(initialId, restored);
       }
 
       chatHydratedRef.current = true;
     } catch (exception) {
       setError(exception.message || 'Failed to load agents.');
     }
-  }, [handleAuthFailure, loadHistoryForAgent]);
+  }, [applyWelcomeSuggestions, handleAuthFailure, loadHistoryForAgent]);
 
   useEffect(() => {
     if (!authenticated) {
       chatHydratedRef.current = false;
       backendSessionIdRef.current = null;
+      activeUserEmailRef.current = null;
+      const agentName = agents.find((agent) => agent.id === selectedAgentId)?.name ?? DEFAULT_AGENTS[0].name;
+      setMessages([createWelcomeMessage(agentName)]);
+      return;
+    }
+
+    if (activeUserEmailRef.current && userEmail && activeUserEmailRef.current !== userEmail) {
+      chatHydratedRef.current = false;
+      backendSessionIdRef.current = null;
+      setQuestion('');
+      setError(null);
       const agentName = agents.find((agent) => agent.id === selectedAgentId)?.name ?? DEFAULT_AGENTS[0].name;
       setMessages([createWelcomeMessage(agentName)]);
     }
-  }, [authenticated, agents, selectedAgentId]);
+
+    activeUserEmailRef.current = userEmail;
+  }, [authenticated, agents, selectedAgentId, userEmail]);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -178,7 +227,8 @@ function App({
     setQuestion('');
     setError(null);
     setMessages(restored);
-  }, [agents, loadHistoryForAgent, messages, selectedAgentId]);
+    applyWelcomeSuggestions(nextAgentId, restored);
+  }, [agents, applyWelcomeSuggestions, loadHistoryForAgent, messages, selectedAgentId]);
 
   const sendQuestion = useCallback(async (text) => {
     if (!selectedAgentId) return;
@@ -223,28 +273,45 @@ function App({
       }
 
       const data = await response.json();
-      const answerText = String(data.answer ?? 'No answer returned.');
-      const isError = !data.success || answerText.startsWith('Error:');
+      const answerText = normalizeAssistantText(data.answer ?? 'No answer returned.');
+      const isError = data.success === false;
+      const assistantId = crypto.randomUUID();
+      const assistantMessage = {
+        id: assistantId,
+        role: 'assistant',
+        text: answerText,
+        animate: true,
+        typewriter: !isError,
+        suggestions: [],
+      };
 
       setMessages((current) => {
-        const assistantMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          text: answerText,
-          animate: true,
-          typewriter: !isError,
-          suggestions: [],
-        };
+        const withAssistant = [...current, assistantMessage];
 
-        const withAnswer = [...current, assistantMessage];
         if (!isError) {
-          assistantMessage.suggestions = suggestQuestionsFromContext(getLastTwoExchanges(withAnswer));
+          const exchanges = getLastTwoExchanges(withAssistant);
+          fetchFollowupSuggestions(selectedAgentId, exchanges)
+            .then((suggestions) => {
+              if (!suggestions?.length) return;
+              setMessages((latest) =>
+                latest.map((message) =>
+                  message.id === assistantId
+                    ? { ...message, suggestions }
+                    : message,
+                ),
+              );
+            })
+            .catch(() => {
+              // Assistant answer still shows without follow-up chips.
+            });
         }
 
-        return withAnswer;
+        return withAssistant;
       });
 
-      if (isError) setError(answerText.replace(/^Error:\s*/, ''));
+      if (isError && !isFabricAccessMessage(answerText)) {
+        setError(answerText);
+      }
     } catch (exception) {
       const message =
         exception.name === 'AbortError'
@@ -308,6 +375,7 @@ function App({
       welcome.animate = true;
       welcome.typewriter = true;
       setMessages([welcome]);
+      applyWelcomeSuggestions(selectedAgentId, [welcome]);
       if (backendSessionIdRef.current) {
         await saveChatHistory(selectedAgentId, [welcome], backendSessionIdRef.current);
       }
@@ -382,7 +450,8 @@ function App({
               role={message.role}
               animate={message.animate}
               typewriter={message.typewriter}
-              suggestions={message.suggestions}
+              suggestions={message.suggestions ?? []}
+              suggestionsLoading={message.suggestionsLoading}
               onSuggestionSelect={handleSuggestionSelect}
               onTypingProgress={scrollToBottom}
             >

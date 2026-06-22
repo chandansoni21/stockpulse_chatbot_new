@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 DB_PATH = Path(__file__).parent / "chat_history.db"
+HISTORY_RETENTION_DAYS = int(os.getenv("CHAT_HISTORY_RETENTION_DAYS", "90"))
 
 
 def _connect() -> sqlite3.Connection:
@@ -14,37 +16,84 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def _migrate_legacy_history(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "chat_history")
+    if "auth_expires_at" not in columns:
+        return
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_history_v2 (
+            user_email TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            backend_session_id TEXT NOT NULL,
+            messages_json TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (user_email, agent_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO chat_history_v2 (
+            user_email,
+            agent_id,
+            backend_session_id,
+            messages_json,
+            updated_at
+        )
+        SELECT
+            user_email,
+            agent_id,
+            backend_session_id,
+            messages_json,
+            updated_at
+        FROM chat_history
+        WHERE rowid IN (
+            SELECT MAX(rowid)
+            FROM chat_history
+            GROUP BY user_email, agent_id
+        )
+        """
+    )
+
+    conn.execute("DROP TABLE chat_history")
+    conn.execute("ALTER TABLE chat_history_v2 RENAME TO chat_history")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_history (
                 user_email TEXT NOT NULL,
-                auth_expires_at REAL NOT NULL,
                 agent_id TEXT NOT NULL,
                 backend_session_id TEXT NOT NULL,
                 messages_json TEXT NOT NULL DEFAULT '[]',
                 updated_at REAL NOT NULL,
-                PRIMARY KEY (user_email, auth_expires_at, agent_id)
+                PRIMARY KEY (user_email, agent_id)
             )
             """
         )
+        _migrate_legacy_history(conn)
         conn.commit()
 
 
 def purge_expired_chat_history() -> None:
     init_db()
-    now = time.time()
+    cutoff = time.time() - (HISTORY_RETENTION_DAYS * 24 * 60 * 60)
     with _connect() as conn:
-        conn.execute("DELETE FROM chat_history WHERE auth_expires_at < ?", (now,))
+        conn.execute("DELETE FROM chat_history WHERE updated_at < ?", (cutoff,))
         conn.commit()
 
 
-def get_chat_history(
-    user_email: str,
-    auth_expires_at: float,
-    agent_id: str,
-) -> dict[str, Any]:
+def get_chat_history(user_email: str, agent_id: str) -> dict[str, Any]:
     init_db()
     purge_expired_chat_history()
 
@@ -53,9 +102,9 @@ def get_chat_history(
             """
             SELECT backend_session_id, messages_json
             FROM chat_history
-            WHERE user_email = ? AND auth_expires_at = ? AND agent_id = ?
+            WHERE user_email = ? AND agent_id = ?
             """,
-            (user_email, float(auth_expires_at), agent_id),
+            (user_email, agent_id),
         ).fetchone()
 
     if not row:
@@ -80,7 +129,6 @@ def get_chat_history(
 
 def save_chat_history(
     user_email: str,
-    auth_expires_at: float,
     agent_id: str,
     messages: list[dict[str, Any]],
     backend_session_id: str,
@@ -92,6 +140,7 @@ def save_chat_history(
             **message,
             "animate": False,
             "typewriter": False,
+            "suggestions": message.get("suggestions") or [],
         }
         for message in messages
     ]
@@ -101,21 +150,19 @@ def save_chat_history(
             """
             INSERT INTO chat_history (
                 user_email,
-                auth_expires_at,
                 agent_id,
                 backend_session_id,
                 messages_json,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_email, auth_expires_at, agent_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_email, agent_id) DO UPDATE SET
                 backend_session_id = excluded.backend_session_id,
                 messages_json = excluded.messages_json,
                 updated_at = excluded.updated_at
             """,
             (
                 user_email,
-                float(auth_expires_at),
                 agent_id,
                 backend_session_id,
                 json.dumps(stored_messages),
@@ -125,20 +172,14 @@ def save_chat_history(
         conn.commit()
 
 
-def clear_chat_history_for_session(
-    user_email: Optional[str],
-    auth_expires_at: Optional[float],
-) -> None:
-    if not user_email or auth_expires_at is None:
+def clear_chat_history_for_user(user_email: Optional[str]) -> None:
+    if not user_email:
         return
 
     init_db()
     with _connect() as conn:
         conn.execute(
-            """
-            DELETE FROM chat_history
-            WHERE user_email = ? AND auth_expires_at = ?
-            """,
-            (user_email, float(auth_expires_at)),
+            "DELETE FROM chat_history WHERE user_email = ?",
+            (user_email,),
         )
         conn.commit()

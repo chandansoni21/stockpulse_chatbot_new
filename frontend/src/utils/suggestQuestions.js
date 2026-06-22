@@ -6,6 +6,10 @@ const DEFAULT_SUGGESTIONS = [
 ];
 
 export function getLastTwoExchanges(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
+  }
+
   const exchanges = [];
 
   for (let i = messages.length - 1; i >= 0 && exchanges.length < 2; i -= 1) {

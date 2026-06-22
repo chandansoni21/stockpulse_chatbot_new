@@ -2,9 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import App from './App';
 import {
   clearAuthExpires,
+  hasSwitchedMicrosoftAccount,
   isAuthExpiredLocally,
   setAuthExpires,
+  setLastUserEmail,
 } from './utils/authStorage';
+import { setStoredAgentId } from './utils/agentStorage';
 import { API_URL } from './utils/apiConfig';
 import {
   readLoginCallback,
@@ -41,7 +44,11 @@ function Root() {
   const applyAuthStatus = useCallback((data) => {
     if (data?.session_days) setSessionDays(data.session_days);
     if (data?.authenticated) {
+      if (hasSwitchedMicrosoftAccount(data.user_email)) {
+        setStoredAgentId(null);
+      }
       setAuthExpires(data.expires_at);
+      setLastUserEmail(data.user_email);
       setAuthenticated(true);
       setUserEmail(data.user_email || null);
       setLoginError(null);

@@ -6,6 +6,8 @@ function normalizeMessages(messages) {
     ...message,
     animate: false,
     typewriter: false,
+    suggestions: message.suggestions ?? [],
+    suggestionsLoading: false,
   }));
 }
 
