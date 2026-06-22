@@ -9,7 +9,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from fabric_data_agent_client import DEFAULT_TIMEOUT, FabricDataAgentClient
-from auth_service import get_auth_status, login_interactive, logout, is_session_valid
+from auth_service import (
+    get_auth_status,
+    get_authenticated_session,
+    login_with_access_token,
+    login_with_auth_code,
+    logout,
+)
+from chat_history_db import (
+    clear_chat_history_for_session,
+    get_chat_history,
+    init_db,
+    purge_expired_chat_history,
+    save_chat_history,
+)
 
 app = FastAPI()
 app.add_middleware(
@@ -91,6 +104,31 @@ class SessionRequest(BaseModel):
     agent_id: str = "stock-pulse"
 
 
+class TokenLoginRequest(BaseModel):
+    access_token: str
+    token_expires_on: Optional[float] = None
+
+
+class CodeLoginRequest(BaseModel):
+    code: str
+    redirect_uri: str
+    code_verifier: str
+
+
+class ChatHistorySaveRequest(BaseModel):
+    agent_id: str
+    messages: list[dict] = Field(default_factory=list)
+    backend_session_id: str
+
+
+def _require_authenticated_session() -> dict:
+    require_authenticated()
+    session = get_authenticated_session()
+    if not session or not session.get("user_email") or session.get("expires_at") is None:
+        raise HTTPException(status_code=401, detail="Microsoft login required. Please sign in first.")
+    return session
+
+
 def _resolve_thread_name(request: ChatRequest, session_id: Optional[str]) -> str:
     key = _thread_key(session_id, request.agent_id)
 
@@ -140,23 +178,71 @@ def require_authenticated():
         raise HTTPException(status_code=401, detail="Microsoft login required. Please sign in first.")
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    init_db()
+    purge_expired_chat_history()
+
+
 @app.get("/auth/status")
 async def auth_status():
     return get_auth_status()
 
 
-@app.post("/auth/login")
-async def auth_login():
+@app.post("/auth/login/code")
+async def auth_login_code(request: CodeLoginRequest):
     try:
-        return login_interactive()
+        return login_with_auth_code(request.code, request.redirect_uri, request.code_verifier)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Microsoft login failed: {exc}") from exc
+
+
+@app.post("/auth/login")
+async def auth_login(request: TokenLoginRequest):
+    try:
+        return login_with_access_token(request.access_token, request.token_expires_on)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"Microsoft login failed: {exc}") from exc
 
 
 @app.post("/auth/logout")
 async def auth_logout():
+    session = get_authenticated_session()
+    if session:
+        clear_chat_history_for_session(session.get("user_email"), session.get("expires_at"))
     _clients.clear()
+    _session_threads.clear()
     return logout()
+
+
+@app.get("/chat/history")
+async def read_chat_history(agent_id: str):
+    session = _require_authenticated_session()
+    get_agent(agent_id)
+    history = get_chat_history(
+        session["user_email"],
+        session["expires_at"],
+        agent_id,
+    )
+    return history
+
+
+@app.put("/chat/history")
+async def write_chat_history(request: ChatHistorySaveRequest):
+    session = _require_authenticated_session()
+    get_agent(request.agent_id)
+    save_chat_history(
+        session["user_email"],
+        session["expires_at"],
+        request.agent_id,
+        request.messages,
+        request.backend_session_id,
+    )
+    return {"saved": True}
 
 
 @app.get("/agents")

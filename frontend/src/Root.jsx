@@ -1,7 +1,34 @@
 import { useCallback, useEffect, useState } from 'react';
 import App from './App';
-import { clearAuthExpires, isAuthExpiredLocally, setAuthExpires } from './utils/authStorage';
+import {
+  clearAuthExpires,
+  isAuthExpiredLocally,
+  setAuthExpires,
+} from './utils/authStorage';
 import { API_URL } from './utils/apiConfig';
+import {
+  readLoginCallback,
+  startLoginRedirect,
+  startLogoutRedirect,
+} from './utils/microsoftAuth';
+
+async function postCodeLogin(callback) {
+  const response = await fetch(`${API_URL}/auth/login/code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code: callback.code,
+      redirect_uri: callback.redirectUri,
+      code_verifier: callback.codeVerifier,
+    }),
+  });
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Microsoft login failed.');
+  }
+  return data;
+}
 
 function Root() {
   const [authChecked, setAuthChecked] = useState(false);
@@ -26,55 +53,50 @@ function Root() {
   }, []);
 
   const checkAuth = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_URL}/auth/status`);
-      if (!response.ok) throw new Error('Could not verify login status.');
-      const data = await response.json();
-      applyAuthStatus(data);
-    } catch {
-      if (!isAuthExpiredLocally()) {
-        setAuthenticated(true);
-      } else {
-        setAuthenticated(false);
-      }
-    } finally {
-      setAuthChecked(true);
-    }
+    const response = await fetch(`${API_URL}/auth/status`);
+    if (!response.ok) throw new Error('Could not verify login status.');
+    const data = await response.json();
+    applyAuthStatus(data);
+    return data;
   }, [applyAuthStatus]);
 
   useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
+    let active = true;
+
+    (async () => {
+      try {
+        const callback = readLoginCallback();
+        const data = callback ? await postCodeLogin(callback) : await checkAuth();
+        if (active && data) {
+          applyAuthStatus(data);
+        }
+      } catch (exception) {
+        if (!active) return;
+        setLoginError(exception.message || 'Microsoft login failed.');
+        if (!isAuthExpiredLocally()) {
+          setAuthenticated(true);
+        } else {
+          setAuthenticated(false);
+        }
+      } finally {
+        if (active) {
+          setAuthChecked(true);
+        }
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [applyAuthStatus, checkAuth]);
 
   const handleLogin = async () => {
     setLoginLoading(true);
     setLoginError(null);
     try {
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 5 * 60 * 1000);
-
-      const response = await fetch(`${API_URL}/auth/login`, {
-        method: 'POST',
-        signal: controller.signal,
-      });
-      window.clearTimeout(timeoutId);
-
-      const data = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(data?.detail || 'Microsoft login failed.');
-      }
-      applyAuthStatus(data);
+      await startLoginRedirect();
     } catch (exception) {
-      const message =
-        exception.name === 'AbortError'
-          ? 'Login took too long. Complete sign-in on the server PC and try again.'
-          : exception.message || 'Microsoft login failed.';
-      setLoginError(
-        message === 'Failed to fetch'
-          ? 'Cannot reach the server. Use the same Wi‑Fi and open the app via your PC IP (not localhost).'
-          : message,
-      );
-    } finally {
+      setLoginError(exception.message || 'Microsoft login failed.');
       setLoginLoading(false);
     }
   };
@@ -89,6 +111,7 @@ function Root() {
     setAuthenticated(false);
     setUserEmail(null);
     setLoginError(null);
+    startLogoutRedirect();
   }, []);
 
   const handleSessionExpired = useCallback(() => {

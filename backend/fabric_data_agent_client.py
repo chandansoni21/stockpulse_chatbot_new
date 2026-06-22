@@ -26,7 +26,7 @@ import warnings
 from typing import Optional
 from openai import OpenAI
 
-from auth_service import acquire_fabric_token, get_credential
+from auth_service import acquire_fabric_token
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,6 @@ class FabricDataAgentClient:
         """
         self.tenant_id = tenant_id
         self.data_agent_url = data_agent_url
-        self.credential = None
         self.token = None
         
         # Validate inputs
@@ -89,8 +88,6 @@ class FabricDataAgentClient:
         print(f"Initializing Fabric Data Agent Client...")
         print(f"Tenant ID: {tenant_id}")
         print(f"Data Agent URL: {data_agent_url}")
-
-        self.credential = get_credential()
     
     def _authenticate(self):
         """
@@ -104,8 +101,6 @@ class FabricDataAgentClient:
         """
         try:
             logger.info("Refreshing authentication token...")
-            if self.credential is None:
-                raise ValueError("No credential available")
             self.token = acquire_fabric_token()
 
         except Exception as e:

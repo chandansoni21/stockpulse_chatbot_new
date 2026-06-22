@@ -9,14 +9,13 @@ import { useSpeechToText } from './hooks/useSpeechToText';
 import {
   createWelcomeMessage,
   getStoredAgentId,
-  loadAgentMessages,
-  saveAgentMessages,
   setStoredAgentId,
 } from './utils/agentStorage';
+import { fetchChatHistory, saveChatHistory } from './utils/chatHistoryApi';
 import { getLastTwoExchanges, suggestQuestionsFromContext } from './utils/suggestQuestions';
 import { API_URL } from './utils/apiConfig';
+
 const REQUEST_TIMEOUT = 300;
-const SESSION_KEY = 'fabric-data-agent-session';
 const DEFAULT_AGENTS = [
   {
     id: 'stock-pulse',
@@ -24,15 +23,6 @@ const DEFAULT_AGENTS = [
     description: 'SKU, stock, store inventory and barcode data',
   },
 ];
-
-function getSessionId() {
-  let sessionId = sessionStorage.getItem(SESSION_KEY);
-  if (!sessionId) {
-    sessionId = crypto.randomUUID();
-    sessionStorage.setItem(SESSION_KEY, sessionId);
-  }
-  return sessionId;
-}
 
 function App({
   authenticated = false,
@@ -44,16 +34,22 @@ function App({
   onLogout,
   onSessionExpired,
 }) {
+  const initialAgentId = getStoredAgentId() || DEFAULT_AGENTS[0].id;
   const [agents, setAgents] = useState(DEFAULT_AGENTS);
-  const [selectedAgentId, setSelectedAgentId] = useState(DEFAULT_AGENTS[0].id);
-  const [messages, setMessages] = useState([createWelcomeMessage(DEFAULT_AGENTS[0].name)]);
+  const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
+  const [messages, setMessages] = useState(() => [
+    createWelcomeMessage(
+      DEFAULT_AGENTS.find((agent) => agent.id === initialAgentId)?.name ?? DEFAULT_AGENTS[0].name,
+    ),
+  ]);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [showSignInModal, setShowSignInModal] = useState(false);
   const bottomRef = useRef(null);
   const pendingSubmitRef = useRef(null);
-  const sessionId = useMemo(() => getSessionId(), []);
+  const chatHydratedRef = useRef(false);
+  const backendSessionIdRef = useRef(null);
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId),
@@ -66,12 +62,16 @@ function App({
     } catch {
       // Still clear local session if the server is unreachable.
     }
+    backendSessionIdRef.current = null;
+    chatHydratedRef.current = false;
     onLogout?.();
   };
 
   const handleAuthFailure = useCallback(
     (response) => {
       if (response?.status === 401) {
+        backendSessionIdRef.current = null;
+        chatHydratedRef.current = false;
         onSessionExpired?.();
         setShowSignInModal(true);
         return true;
@@ -80,6 +80,18 @@ function App({
     },
     [onSessionExpired],
   );
+
+  const loadHistoryForAgent = useCallback(async (agentId, agentName) => {
+    try {
+      const history = await fetchChatHistory(agentId);
+      backendSessionIdRef.current = history.backendSessionId;
+      return history.messages?.length
+        ? history.messages
+        : [createWelcomeMessage(agentName)];
+    } catch {
+      return [createWelcomeMessage(agentName)];
+    }
+  }, []);
 
   const loadAgents = useCallback(async () => {
     try {
@@ -92,19 +104,31 @@ function App({
 
       const storedId = getStoredAgentId();
       const initialId = list.find((agent) => agent.id === storedId)?.id ?? list[0]?.id ?? DEFAULT_AGENTS[0].id;
-      if (initialId) {
-        setSelectedAgentId(initialId);
-        setStoredAgentId(initialId);
-        if (!pendingSubmitRef.current) {
-          const saved = loadAgentMessages(sessionId, initialId);
-          const agentName = list.find((agent) => agent.id === initialId)?.name ?? DEFAULT_AGENTS[0].name;
-          setMessages(saved?.length ? saved : [createWelcomeMessage(agentName)]);
-        }
+      if (!initialId) return;
+
+      setSelectedAgentId(initialId);
+      setStoredAgentId(initialId);
+
+      if (!pendingSubmitRef.current) {
+        const agentName = list.find((agent) => agent.id === initialId)?.name ?? DEFAULT_AGENTS[0].name;
+        const restored = await loadHistoryForAgent(initialId, agentName);
+        setMessages(restored);
       }
+
+      chatHydratedRef.current = true;
     } catch (exception) {
       setError(exception.message || 'Failed to load agents.');
     }
-  }, [handleAuthFailure, sessionId]);
+  }, [handleAuthFailure, loadHistoryForAgent]);
+
+  useEffect(() => {
+    if (!authenticated) {
+      chatHydratedRef.current = false;
+      backendSessionIdRef.current = null;
+      const agentName = agents.find((agent) => agent.id === selectedAgentId)?.name ?? DEFAULT_AGENTS[0].name;
+      setMessages([createWelcomeMessage(agentName)]);
+    }
+  }, [authenticated, agents, selectedAgentId]);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -115,10 +139,18 @@ function App({
   }, [messages, loading, scrollToBottom]);
 
   useEffect(() => {
-    if (selectedAgentId && messages.length) {
-      saveAgentMessages(sessionId, selectedAgentId, messages);
+    if (!authenticated || !chatHydratedRef.current || !selectedAgentId || !messages.length) {
+      return undefined;
     }
-  }, [messages, selectedAgentId, sessionId]);
+
+    const timeoutId = window.setTimeout(() => {
+      saveChatHistory(selectedAgentId, messages, backendSessionIdRef.current).catch(() => {
+        // Ignore background save errors; the next change will retry.
+      });
+    }, 300);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [authenticated, messages, selectedAgentId]);
 
   useEffect(() => {
     if (authenticated) {
@@ -126,26 +158,27 @@ function App({
     }
   }, [authenticated, loadAgents]);
 
-  const switchAgent = useCallback((nextAgentId) => {
+  const switchAgent = useCallback(async (nextAgentId) => {
     if (!nextAgentId || nextAgentId === selectedAgentId) return;
 
-    if (selectedAgentId && messages.length) {
-      saveAgentMessages(sessionId, selectedAgentId, messages);
+    if (selectedAgentId && messages.length && backendSessionIdRef.current) {
+      try {
+        await saveChatHistory(selectedAgentId, messages, backendSessionIdRef.current);
+      } catch {
+        // Continue switching even if save fails.
+      }
     }
 
     const nextAgent = agents.find((agent) => agent.id === nextAgentId);
-    const saved = loadAgentMessages(sessionId, nextAgentId);
+    const agentName = nextAgent?.name ?? 'Data Agent';
+    const restored = await loadHistoryForAgent(nextAgentId, agentName);
 
     setSelectedAgentId(nextAgentId);
     setStoredAgentId(nextAgentId);
     setQuestion('');
     setError(null);
-    setMessages(
-      saved?.length
-        ? saved
-        : [createWelcomeMessage(nextAgent?.name ?? 'Data Agent')],
-    );
-  }, [agents, messages, selectedAgentId, sessionId]);
+    setMessages(restored);
+  }, [agents, loadHistoryForAgent, messages, selectedAgentId]);
 
   const sendQuestion = useCallback(async (text) => {
     if (!selectedAgentId) return;
@@ -169,7 +202,7 @@ function App({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Session-Id': sessionId,
+          'X-Session-Id': backendSessionIdRef.current,
         },
         body: JSON.stringify({
           question: questionText,
@@ -222,7 +255,7 @@ function App({
       window.clearTimeout(timeoutId);
       setLoading(false);
     }
-  }, [handleAuthFailure, loading, selectedAgentId, sessionId]);
+  }, [handleAuthFailure, loading, selectedAgentId]);
 
   useEffect(() => {
     if (!authenticated || !pendingSubmitRef.current) return;
@@ -264,7 +297,7 @@ function App({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Session-Id': sessionId,
+          'X-Session-Id': backendSessionIdRef.current,
         },
         body: JSON.stringify({ agent_id: selectedAgentId }),
       });
@@ -275,6 +308,9 @@ function App({
       welcome.animate = true;
       welcome.typewriter = true;
       setMessages([welcome]);
+      if (backendSessionIdRef.current) {
+        await saveChatHistory(selectedAgentId, [welcome], backendSessionIdRef.current);
+      }
     } catch (exception) {
       setError(exception.message || 'Failed to start a new session.');
     }

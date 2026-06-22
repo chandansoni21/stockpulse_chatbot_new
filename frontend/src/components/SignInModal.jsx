@@ -51,7 +51,7 @@ const SignInModal = ({
             Sign in to continue
           </h2>
           <p className="mt-1.5 text-xs leading-relaxed text-slate-500 sm:text-sm">
-            Use your Microsoft account to ask questions.
+            Microsoft sign-in opens in this same tab and returns you here.
           </p>
         </div>
 
@@ -68,11 +68,11 @@ const SignInModal = ({
           className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:border-brand-500 hover:bg-slate-50 disabled:opacity-60"
         >
           <MicrosoftIcon />
-          {loading ? 'Opening Microsoft login...' : 'Sign in with Microsoft'}
+          {loading ? 'Redirecting to Microsoft...' : 'Sign in with Microsoft'}
         </button>
 
         <p className="mt-3 text-center text-[11px] text-slate-400 sm:text-xs">
-          Stay signed in for {sessionDays} days.
+          Stay signed in for {sessionDays} days. Sign-out only ends this app session.
         </p>
       </div>
     </div>
