@@ -5,6 +5,12 @@
       "name": "Stock Pulse Agent",
       "description": "SKU, stock, store inventory and barcode data",
       "data_agent_url": "https://api.fabric.microsoft.com/v1/workspaces/411f437b-71b5-4416-b399-86a34e5518dc/dataagents/c8ba6773-005d-42dc-85c6-7cae2a9dc726/aiassistant/openai"
+    },
+    {
+      "id": "br",
+      "name": "Billing Agent",
+      "description": "Billing and business reporting data",
+      "data_agent_url": "https://api.fabric.microsoft.com/v1/workspaces/c4747ca1-4572-4cbd-8b54-9baf6adaca44/dataagents/1237c2a4-c4ec-4260-8139-1241955764a7/aiassistant/openai"
     }
   ]
 }

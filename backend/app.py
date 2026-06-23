@@ -102,8 +102,9 @@ def get_agent(agent_id: str) -> dict:
     raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
 
-def get_client(agent_id: str, user_email: Optional[str] = None) -> FabricDataAgentClient:
-    cache_key = f"{(user_email or 'anonymous').strip().lower()}:{agent_id}"
+def get_client(agent_id: str, user_email: Optional[str] = None, user_oid: Optional[str] = None) -> FabricDataAgentClient:
+    identity = (user_oid or user_email or "anonymous").strip().lower()
+    cache_key = f"{identity}:{agent_id}"
     if cache_key in _clients:
         return _clients[cache_key]
 
@@ -115,8 +116,13 @@ def get_client(agent_id: str, user_email: Optional[str] = None) -> FabricDataAge
     return _clients[cache_key]
 
 
-def _reset_chat_thread(user_email: Optional[str], session_id: Optional[str], agent_id: str) -> str:
-    key = _thread_key(user_email, session_id, agent_id)
+def _reset_chat_thread(
+    user_email: Optional[str],
+    user_oid: Optional[str],
+    session_id: Optional[str],
+    agent_id: str,
+) -> str:
+    key = _thread_key(user_email, user_oid, session_id, agent_id)
     _session_threads.pop(key, None)
     thread_name = f"web-session-{uuid.uuid4()}"
     _session_threads[key] = thread_name
@@ -130,30 +136,31 @@ def _run_chat_question(
     timeout: int,
     include_details: bool,
 ) -> dict:
-    if include_details:
-        return client.ask_with_details(
-            question,
-            timeout=timeout,
-            thread_name=thread_name,
-            preserve_thread=True,
-        )
-
-    answer = client.ask(
+    result = client.ask_with_details(
         question,
         timeout=timeout,
         thread_name=thread_name,
         preserve_thread=True,
     )
-    return {
-        "answer": answer,
-        "thread": {"name": thread_name},
-        "success": not FabricDataAgentClient.is_fabric_access_error(str(answer)),
-        "run_status": "completed" if not FabricDataAgentClient.is_fabric_access_error(str(answer)) else "failed",
-    }
+    if not include_details:
+        result = {
+            "answer": result.get("answer"),
+            "charts": result.get("charts") or [],
+            "thread": result.get("thread") or {"name": thread_name},
+            "success": result.get("success", True),
+            "run_status": result.get("run_status"),
+        }
+    return result
 
 
-def _thread_key(user_email: Optional[str], session_id: Optional[str], agent_id: str) -> str:
-    return f"{user_email or 'anonymous'}:{session_id or 'anonymous'}:{agent_id}"
+def _thread_key(
+    user_email: Optional[str],
+    user_oid: Optional[str],
+    session_id: Optional[str],
+    agent_id: str,
+) -> str:
+    identity = (user_oid or user_email or "anonymous").strip().lower()
+    return f"{identity}:{session_id or 'anonymous'}:{agent_id}"
 
 
 class ChatRequest(BaseModel):
@@ -208,8 +215,9 @@ def _resolve_thread_name(
     request: ChatRequest,
     session_id: Optional[str],
     user_email: Optional[str],
+    user_oid: Optional[str] = None,
 ) -> str:
-    key = _thread_key(user_email, session_id, request.agent_id)
+    key = _thread_key(user_email, user_oid, session_id, request.agent_id)
 
     if request.new_session:
         thread_name = f"web-session-{uuid.uuid4()}"
@@ -228,6 +236,40 @@ def _resolve_thread_name(
     return thread_name
 
 
+def _strip_agent_boilerplate(text: Optional[str]) -> Optional[str]:
+    import re
+
+    if not text:
+        return text
+    cleaned = str(text)
+    patterns = (
+        r"^File\(s\)\s+report_specs[^\n]*\n?",
+        r"(?im)^\s*(?:you can )?(?:now )?view (?:the |this |your )?(?:pie |bar |line )?(?:chart|graph)[^\n]*(?:dashboard|below|above)[^\n]*\n?",
+        r"(?im)^\s*(?:the )?(?:pie |bar |line )?(?:chart|graph) is (?:available|shown)[^\n]*(?:dashboard|below|above)[^\n]*\n?",
+        r"(?im)^\s*see (?:the |your )?(?:chart|graph) (?:on|in) your dashboard[^\n]*\n?",
+        r"(?im)^\s*(?:chart|graph) on your dashboard[^\n]*\n?",
+    )
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _log_chat_response(question: str, result: dict) -> None:
+    answer = _strip_agent_boilerplate(result.get("answer"))
+    charts = result.get("charts") or []
+    print("\n" + "=" * 80, flush=True)
+    print(f"CHAT QUESTION: {question}", flush=True)
+    print("-" * 80, flush=True)
+    print(f"CHAT ANSWER:\n{answer}", flush=True)
+    print("-" * 80, flush=True)
+    print(
+        f"charts={len(charts)} | run_status={result.get('run_status')} | success={result.get('success')}",
+        flush=True,
+    )
+    print("=" * 80 + "\n", flush=True)
+
+
 def _format_chat_response(result: dict, agent_id: str) -> dict:
     thread = result.get("thread") or {}
     previews = result.get("sql_data_previews") or []
@@ -239,8 +281,9 @@ def _format_chat_response(result: dict, agent_id: str) -> dict:
             flat_preview.append(str(preview))
 
     return {
-        "answer": result.get("answer"),
+        "answer": _strip_agent_boilerplate(result.get("answer")),
         "agent_id": agent_id,
+        "charts": result.get("charts") or [],
         "reframed_query": result.get("reframed_query"),
         "sql_queries": result.get("sql_queries") or [],
         "data_retrieval_query": result.get("data_retrieval_query"),
@@ -345,7 +388,7 @@ async def agent_suggestions(
 ):
     session = _require_authenticated_session()
     agent = get_agent(agent_id)
-    client = get_client(agent_id, session["user_email"])
+    client = get_client(agent_id, session["user_email"], session.get("user_oid"))
     suggestions = generate_agent_suggestions(
         client,
         agent,
@@ -360,7 +403,7 @@ async def agent_suggestions(
 async def agent_followup_suggestions(agent_id: str, request: FollowupSuggestionsRequest):
     session = _require_authenticated_session()
     agent = get_agent(agent_id)
-    client = get_client(agent_id, session["user_email"])
+    client = get_client(agent_id, session["user_email"], session.get("user_oid"))
     exchanges = [exchange.model_dump() for exchange in request.exchanges]
     suggestions = generate_followup_suggestions(
         client,
@@ -379,8 +422,13 @@ async def chat(
 ):
     session = _require_authenticated_session()
     get_agent(request.agent_id)
-    client = get_client(request.agent_id, session["user_email"])
-    thread_name = _resolve_thread_name(request, x_session_id, session["user_email"])
+    client = get_client(request.agent_id, session["user_email"], session.get("user_oid"))
+    thread_name = _resolve_thread_name(
+        request,
+        x_session_id,
+        session["user_email"],
+        session.get("user_oid"),
+    )
 
     result = _run_chat_question(
         client,
@@ -392,7 +440,12 @@ async def chat(
 
     answer_text = str(result.get("answer") or "")
     if is_retryable_fabric_error(answer_text):
-        retry_thread = _reset_chat_thread(session["user_email"], x_session_id, request.agent_id)
+        retry_thread = _reset_chat_thread(
+            session["user_email"],
+            session.get("user_oid"),
+            x_session_id,
+            request.agent_id,
+        )
         result = _run_chat_question(
             client,
             request.question,
@@ -408,6 +461,7 @@ async def chat(
         result["success"] = False
         result["run_status"] = "failed"
 
+    _log_chat_response(request.question, result)
     return _format_chat_response(result, request.agent_id)
 
 
@@ -418,8 +472,13 @@ async def chat_details(
 ):
     session = _require_authenticated_session()
     get_agent(request.agent_id)
-    client = get_client(request.agent_id, session["user_email"])
-    thread_name = _resolve_thread_name(request, x_session_id, session["user_email"])
+    client = get_client(request.agent_id, session["user_email"], session.get("user_oid"))
+    thread_name = _resolve_thread_name(
+        request,
+        x_session_id,
+        session["user_email"],
+        session.get("user_oid"),
+    )
     return client.get_run_details(
         request.question,
         thread_name=thread_name,
@@ -435,7 +494,7 @@ async def new_session(
     session = _require_authenticated_session()
     get_agent(request.agent_id)
     thread_name = f"web-session-{uuid.uuid4()}"
-    key = _thread_key(session["user_email"], x_session_id, request.agent_id)
+    key = _thread_key(session["user_email"], session.get("user_oid"), x_session_id, request.agent_id)
     _session_threads[key] = thread_name
     agent = get_agent(request.agent_id)
     return {

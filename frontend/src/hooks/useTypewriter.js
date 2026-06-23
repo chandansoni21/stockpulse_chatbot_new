@@ -21,9 +21,7 @@ export function useTypewriter(text, active, { onComplete, onProgress } = {}) {
     let index = 0;
     const timer = window.setInterval(() => {
       index = Math.min(index + charsPerTick, length);
-      const next = text.slice(0, index);
-      setDisplayed(next);
-      onProgress?.();
+      setDisplayed(text.slice(0, index));
 
       if (index >= length) {
         window.clearInterval(timer);
@@ -33,7 +31,13 @@ export function useTypewriter(text, active, { onComplete, onProgress } = {}) {
     }, intervalMs);
 
     return () => window.clearInterval(timer);
-  }, [active, text, onComplete, onProgress]);
+  }, [active, text, onComplete]);
+
+  useEffect(() => {
+    if (!active || done) return undefined;
+    onProgress?.();
+    return undefined;
+  }, [active, displayed, done, onProgress]);
 
   return { displayed, done, isTyping: active && !done };
 }

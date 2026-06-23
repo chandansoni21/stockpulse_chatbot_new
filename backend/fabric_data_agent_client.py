@@ -19,6 +19,7 @@ Usage:
 import time
 import uuid
 import json
+import re
 import os, requests
 import sys
 import logging
@@ -48,6 +49,55 @@ except ImportError:
 DEFAULT_TIMEOUT = 300
 POLL_INTERVAL_SECONDS = 3
 HTTP_REQUEST_TIMEOUT = 30.0
+VEGA_LITE_SCHEMA = "https://vega.github.io/schema/vega-lite/v6.json"
+
+_CHART_QUESTION_PATTERNS = (
+    r"\b(?:pie|bar|line|column|area|scatter|donut|doughnut)\s+(?:chart|graph|plot)\b",
+    r"\b(?:chart|graph|plot)\s+(?:of|for|showing)\b",
+    r"\bchart\b",
+    r"\bgraph\b",
+    r"\bvisuali[sz]e\b",
+    r"\bvisuali[sz]ation\b",
+    r"\bshow\b[^.?!]{0,48}\b(?:chart|graph|plot|visual)\b",
+    r"\bdisplay\b[^.?!]{0,48}\b(?:chart|graph|plot|visual)\b",
+    r"\bas a (?:chart|graph|plot)\b",
+    r"\btrend\b[^.?!]{0,32}\b(?:chart|graph|plot|visual)\b",
+    r"\b(?:chart|graph|plot|visual)\b[^.?!]{0,32}\btrend\b",
+)
+
+_AFFIRMATIVE_CHART_REPLIES = (
+    r"^yes(?:\s+please)?[!.]*$",
+    r"^yeah[!.]*$",
+    r"^yep[!.]*$",
+    r"^sure[!.]*$",
+    r"^(?:ok|okay)(?:\s+please)?[!.]*$",
+    r"^please[!.]*$",
+    r"^go ahead[!.]*$",
+    r"^do it[!.]*$",
+    r"^show (?:it|me|the chart)(?:\s+please)?[!.]*$",
+    r"^visuali[sz]e (?:it|this)(?:\s+please)?[!.]*$",
+    r"^show (?:a |the )?(?:chart|graph)[!.]*$",
+)
+
+_CHART_ANSWER_PATTERNS = (
+    r"\bhere(?:'s| is) (?:the |a )?(?:(?:line|bar|pie|column|area|scatter)\s+)?(?:chart|graph)\b",
+    r"\bhere(?:'s| is) (?:the |a )?(?:line|bar|pie|column|area)\s+(?:chart|graph|plot)\b",
+    r"\bhere(?:'s| is) (?:the |a )?line chart representing\b",
+    r"\b(?:line|bar|pie|column|area)\s+(?:chart|graph|plot) (?:depicting|showing|of|for|representing)\b",
+    r"\bvisualized as (?:a |the )?(?:pie|bar|line|column|area)?\s*(?:chart|graph)\b",
+    r"\bview (?:the |a )?(?:pie|bar|line|column|area)?\s*(?:chart|graph)\b",
+    r"\b(?:pie|bar|line) chart (?:provides|helps|shows)\b",
+    r"\bincluded in the chart\b",
+    r"\b(?:the |this |following )?(?:chart|graph) (?:below|above|shows|illustrates|displays|represents|depicts|highlights)\b",
+    r"\b(?:chart|graph) below\b",
+    r"\bsee (?:the )?(?:chart|graph)\b",
+    r"\b(?:shown|presented|illustrated|depicted) (?:in|as) (?:the |a |this )?(?:chart|graph)\b",
+    r"\bi(?:'ve| have) (?:created|generated|built|plotted) (?:a |the )?(?:chart|graph|visualization|visualisation)\b",
+    r"\bcreated (?:a |the )?(?:chart|graph|visualization|visualisation)\b",
+    r"\b(?:chart|graph) (?:is|has been) (?:shown|displayed|included|rendered|plotted)\b",
+    r"\b(?:view|interact with) (?:this |the )?chart\b",
+    r"\bx-axis\b.*\by-axis\b",
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -154,6 +204,9 @@ class FabricDataAgentClient:
         return (
             "itemnotfound" in lowered
             or "error code: 404" in lowered
+            or "error code: 403" in lowered
+            or "insufficientprivileges" in lowered
+            or "user id" in lowered and "don't match" in lowered
             or "could not found the requested item" in lowered
             or "does not have access to the fabric data agent" in lowered
             or "couldn't reach the fabric data agent" in lowered
@@ -162,6 +215,12 @@ class FabricDataAgentClient:
     @staticmethod
     def format_fabric_error(error: Exception | str, user_email: Optional[str] = None) -> str:
         message = str(error).strip()
+        lowered = message.lower()
+        if "user id" in lowered and "don't match" in lowered:
+            return (
+                "Your Microsoft sign-in no longer matches this chat session. "
+                "Click New chat, or sign out and sign in again, then retry your question."
+            )
         if FabricDataAgentClient.is_fabric_access_error(message):
             return (
                 "I couldn't reach the Fabric Data Agent. The workspace or agent URL may be wrong, "
@@ -211,6 +270,10 @@ class FabricDataAgentClient:
 
         response = requests.get(get_new_thread_url, headers=headers, timeout=HTTP_REQUEST_TIMEOUT)
         if response.status_code == 404:
+            client = self._get_openai_client()
+            return self._create_thread_via_openai(client, thread_name)
+
+        if response.status_code == 403 and "user id" in response.text.lower():
             client = self._get_openai_client()
             return self._create_thread_via_openai(client, thread_name)
 
@@ -329,6 +392,1111 @@ class FabricDataAgentClient:
 
         return candidates[0].strip() if candidates else None
 
+    @staticmethod
+    def _is_vega_lite_spec(value) -> bool:
+        if not isinstance(value, dict):
+            return False
+        schema = str(value.get("$schema", "")).lower()
+        if "vega-lite" in schema:
+            return True
+        return "mark" in value and "encoding" in value
+
+    @staticmethod
+    def _is_pbir_visual_spec(value) -> bool:
+        if not isinstance(value, dict):
+            return False
+        visual = value.get("visual")
+        if not isinstance(visual, dict):
+            visual = value.get("payload", {}).get("visual") if isinstance(value.get("payload"), dict) else None
+        return isinstance(visual, dict) and bool(visual.get("visualType"))
+
+    @staticmethod
+    def _parse_markdown_table_to_rows(lines) -> list[dict]:
+        import re
+
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+
+        table_lines = []
+        for line in lines:
+            stripped = str(line).strip()
+            if "|" not in stripped:
+                continue
+            if re.match(r"^[\|\s\-:]+$", stripped):
+                continue
+            table_lines.append(stripped)
+
+        if len(table_lines) < 2:
+            return []
+
+        def split_row(line: str) -> list[str]:
+            return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+        headers = split_row(table_lines[0])
+        if not headers:
+            return []
+
+        rows = []
+        for line in table_lines[1:]:
+            cells = split_row(line)
+            if len(cells) < len(headers):
+                cells.extend([""] * (len(headers) - len(cells)))
+            row = {headers[index]: cells[index] if index < len(cells) else "" for index in range(len(headers))}
+            if any(str(value).strip() for value in row.values()):
+                rows.append(row)
+        return rows
+
+    def _normalize_row_values(self, rows: list[dict]) -> list[dict]:
+        normalized = []
+        for row in rows:
+            next_row = {}
+            for key, value in row.items():
+                flat_key = self._resolve_field_name(key) or str(key)
+                if value is None or value == "":
+                    next_row[flat_key] = value
+                    continue
+                if isinstance(value, dict):
+                    inner_value = value.get("value")
+                    if inner_value is not None:
+                        next_row[flat_key] = inner_value
+                        continue
+                    if value.get("type") and value.get("name"):
+                        continue
+                if isinstance(value, (int, float)):
+                    next_row[flat_key] = value
+                    continue
+                text = str(value).strip().replace(",", "")
+                try:
+                    if "." in text:
+                        next_row[flat_key] = float(text)
+                    else:
+                        next_row[flat_key] = int(text)
+                except ValueError:
+                    next_row[flat_key] = value
+            normalized.append(next_row)
+        return normalized
+
+    @staticmethod
+    def _resolve_field_name(field) -> Optional[str]:
+        import ast
+        import re
+
+        if field is None:
+            return None
+        if isinstance(field, dict):
+            for key in ("field", "name", "Property"):
+                nested = field.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+                if isinstance(nested, dict):
+                    resolved = FabricDataAgentClient._resolve_field_name(nested)
+                    if resolved:
+                        return resolved
+            return None
+
+        text = str(field).strip()
+        if not text:
+            return None
+
+        for pattern in (
+            r"['\"]name['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+            r"['\"]Property['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+            r"['\"]field['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                parsed = ast.literal_eval(text)
+                return FabricDataAgentClient._resolve_field_name(parsed)
+            except (SyntaxError, ValueError):
+                pass
+
+        return text
+
+    @staticmethod
+    def _humanize_field_name(name: str) -> str:
+        import re
+        return re.sub(r"\s+", " ", str(name).replace("_", " ")).strip()
+
+    def _sanitize_text_label(self, value) -> Optional[str]:
+        resolved = self._resolve_field_name(value)
+        if resolved:
+            return self._humanize_field_name(resolved)
+        if isinstance(value, dict) and value.get("text"):
+            return self._sanitize_text_label(value["text"])
+        if isinstance(value, str):
+            text = value.strip()
+            if not text or text.startswith("{"):
+                return None
+            if len(text) > 80:
+                return None
+            return text
+        return None
+
+    def _sanitize_encoding_channel(self, channel):
+        if isinstance(channel, list):
+            return [self._sanitize_encoding_channel(item) for item in channel]
+        if not isinstance(channel, dict):
+            return channel
+
+        sanitized = dict(channel)
+        resolved_field = self._resolve_field_name(sanitized.get("field"))
+        if resolved_field:
+            sanitized["field"] = resolved_field
+        elif "field" in sanitized:
+            sanitized.pop("field", None)
+
+        clean_title = self._sanitize_text_label(sanitized.get("title"))
+        if clean_title:
+            sanitized["title"] = clean_title
+        else:
+            sanitized.pop("title", None)
+
+        for nested_key in ("axis", "legend"):
+            nested = sanitized.get(nested_key)
+            if isinstance(nested, dict):
+                nested = dict(nested)
+                nested_title = self._sanitize_text_label(nested.get("title"))
+                if nested_title:
+                    nested["title"] = nested_title
+                else:
+                    nested.pop("title", None)
+                sanitized[nested_key] = nested
+
+        return sanitized
+
+    def _align_field_to_columns(self, field_name: Optional[str], columns: list[str]) -> Optional[str]:
+        if not field_name:
+            return field_name
+        if field_name in columns:
+            return field_name
+
+        lowered = field_name.lower()
+        for column in columns:
+            if column.lower() == lowered:
+                return column
+            if column.replace("_", "").lower() == field_name.replace("_", "").lower():
+                return column
+        return field_name
+
+    def _sanitize_vega_spec(self, spec: dict) -> dict:
+        merged = json.loads(json.dumps(spec, default=str))
+        merged["$schema"] = VEGA_LITE_SCHEMA
+
+        data_values = merged.get("data", {}).get("values") if isinstance(merged.get("data"), dict) else None
+        if isinstance(data_values, list):
+            merged["data"]["values"] = self._normalize_row_values(
+                [row for row in data_values if isinstance(row, dict)]
+            )
+            columns = list(merged["data"]["values"][0].keys()) if merged["data"]["values"] else []
+        else:
+            columns = []
+
+        encoding = merged.get("encoding")
+        if isinstance(encoding, dict):
+            sanitized_encoding = {}
+            for channel_name, channel_value in encoding.items():
+                sanitized_channel = self._sanitize_encoding_channel(channel_value)
+                if isinstance(sanitized_channel, dict) and columns and sanitized_channel.get("field"):
+                    sanitized_channel["field"] = self._align_field_to_columns(
+                        sanitized_channel["field"],
+                        columns,
+                    )
+                sanitized_encoding[channel_name] = sanitized_channel
+            merged["encoding"] = sanitized_encoding
+
+        title = merged.get("title")
+        title_text = title.get("text") if isinstance(title, dict) else title
+        if isinstance(title_text, str):
+            lowered = title_text.lower()
+            if lowered.startswith("here is a") or lowered.startswith("here is the") or len(title_text) > 80:
+                merged.pop("title", None)
+
+        merged["autosize"] = {"type": "pad", "contains": "padding", "resize": False}
+        if merged.get("width") == "container" or not merged.get("width"):
+            merged["width"] = 400
+        if not merged.get("height"):
+            merged["height"] = 300
+
+        return merged
+
+    def _extract_row_tables_from_text(self, text: str) -> list[list[dict]]:
+        import re
+
+        tables: list[list[dict]] = []
+        if not text:
+            return tables
+
+        markdown_table = self._extract_markdown_table(text)
+        if markdown_table:
+            rows = self._parse_markdown_table_to_rows(markdown_table.splitlines())
+            if rows:
+                tables.append(self._normalize_row_values(rows))
+
+        for match in re.finditer(r"\[\s*\{", text):
+            snippet = text[match.start():]
+            for end in range(len(snippet), 2, -1):
+                try:
+                    parsed = json.loads(snippet[:end])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    tables.append(self._normalize_row_values(parsed))
+                    break
+
+        tables.extend(self._parse_list_tables_from_text(text))
+        tables.extend(self._parse_trend_rows_from_text(text))
+
+        return tables
+
+    def _extract_row_tables_from_previews(self, previews) -> list[list[dict]]:
+        tables: list[list[dict]] = []
+        for preview in previews or []:
+            if isinstance(preview, list):
+                rows = self._parse_markdown_table_to_rows(preview)
+                if rows:
+                    tables.append(self._normalize_row_values(rows))
+            elif isinstance(preview, str) and "|" in preview:
+                rows = self._parse_markdown_table_to_rows(preview.splitlines())
+                if rows:
+                    tables.append(self._normalize_row_values(rows))
+        return tables
+
+    def _extract_all_row_tables(
+        self,
+        steps,
+        sql_previews,
+        messages,
+        answer: str,
+        question: str = "",
+    ) -> list[list[dict]]:
+        tables: list[list[dict]] = []
+        tables.extend(self._extract_raw_tables_from_steps(steps))
+        tables.extend(self._extract_row_tables_from_previews(sql_previews))
+        tables.extend(self._extract_row_tables_from_text(answer))
+        tables.extend(self._extract_row_tables_from_text(question))
+
+        if messages:
+            try:
+                for msg in messages.data:
+                    text = self._extract_message_text(msg)
+                    if text:
+                        tables.extend(self._extract_row_tables_from_text(text))
+            except Exception as exc:
+                print(f"⚠️ Warning: Could not parse conversation tables: {exc}")
+
+        unique_tables: list[list[dict]] = []
+        seen = set()
+        for table in tables:
+            if not table or not isinstance(table[0], dict):
+                continue
+            normalized = self._normalize_row_values(table)
+            signature = (tuple(sorted(normalized[0].keys())), len(normalized), json.dumps(normalized[:3], sort_keys=True, default=str))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            unique_tables.append(normalized)
+        return unique_tables
+
+    @staticmethod
+    def _pbir_visual_type_to_mark(visual_type: str) -> str:
+        lowered = (visual_type or "").lower()
+        if "pie" in lowered or "donut" in lowered:
+            return "arc"
+        if "line" in lowered:
+            return "line"
+        if "area" in lowered:
+            return "area"
+        if "scatter" in lowered:
+            return "point"
+        if "bar" in lowered or "column" in lowered:
+            return "bar"
+        return "bar"
+
+    def _pbir_field_from_projection(self, projection: dict) -> Optional[str]:
+        field = projection.get("field", {}) if isinstance(projection, dict) else {}
+        for key in ("Column", "Measure", "Aggregation"):
+            node = field.get(key)
+            if isinstance(node, dict) and node.get("Property"):
+                return str(node["Property"])
+        return None
+
+    def _pbir_to_vega_spec(self, pbir_spec: dict, rows: list[dict]) -> Optional[dict]:
+        visual = pbir_spec.get("visual")
+        if not isinstance(visual, dict):
+            payload = pbir_spec.get("payload")
+            visual = payload.get("visual") if isinstance(payload, dict) else None
+        if not isinstance(visual, dict):
+            return None
+
+        visual_type = str(visual.get("visualType") or "")
+        mark_type = self._pbir_visual_type_to_mark(visual_type)
+        query_state = visual.get("query", {}).get("queryState", {})
+        if not isinstance(query_state, dict):
+            query_state = {}
+
+        fields = {}
+        for bucket, config in query_state.items():
+            if not isinstance(config, dict):
+                continue
+            for projection in config.get("projections", []) or []:
+                field_name = self._pbir_field_from_projection(projection)
+                if field_name:
+                    fields[str(bucket).lower()] = field_name
+
+        columns = list(rows[0].keys()) if rows else []
+        numeric_cols = [col for col in columns if self._column_is_numeric(rows, col)] if rows else []
+        category_cols = [col for col in columns if col not in numeric_cols] if rows else []
+
+        value_field = fields.get("y") or fields.get("values") or fields.get("value") or (numeric_cols[0] if numeric_cols else None)
+        category_field = (
+            fields.get("category")
+            or fields.get("series")
+            or fields.get("legend")
+            or (category_cols[0] if category_cols else None)
+        )
+
+        if not value_field:
+            return None
+
+        if mark_type == "arc":
+            encoding = {
+                "theta": {"field": value_field, "type": "quantitative", "aggregate": "sum"},
+                "color": {"field": category_field or category_cols[0] if category_cols else columns[0], "type": "nominal"},
+            }
+        else:
+            x_field = fields.get("category") or fields.get("x") or category_field or (columns[0] if columns else None)
+            encoding = {
+                "x": {"field": x_field, "type": "nominal"},
+                "y": {"field": value_field, "type": "quantitative", "aggregate": "sum"},
+            }
+            series_field = fields.get("series") or fields.get("legend")
+            if series_field:
+                encoding["color"] = {"field": series_field, "type": "nominal"}
+
+        return {
+            "$schema": VEGA_LITE_SCHEMA,
+            "width": 400,
+            "height": 300,
+            "data": {"values": rows},
+            "mark": {"type": mark_type, "point": mark_type == "line"},
+            "encoding": encoding,
+        }
+
+    @staticmethod
+    def _question_requests_chart(question: str) -> bool:
+        text = (question or "").strip().lower()
+        if not text:
+            return False
+
+        sanitized = re.sub(r"\bbarcodes?\b", "", text)
+        for pattern in _CHART_QUESTION_PATTERNS:
+            if re.search(pattern, sanitized, re.IGNORECASE):
+                return True
+
+        if re.search(r"\bbar\b", sanitized) and re.search(
+            r"\b(?:chart|graph|plot|compare|comparison|visual)\b", sanitized
+        ):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_affirmative_chart_followup(question: str) -> bool:
+        text = re.sub(r"\s+", " ", (question or "").strip().lower())
+        if not text:
+            return False
+        return any(re.match(pattern, text, re.IGNORECASE) for pattern in _AFFIRMATIVE_CHART_REPLIES)
+
+    @classmethod
+    def _should_show_charts(cls, question: str, answer: str) -> bool:
+        if cls._question_requests_chart(question):
+            return True
+        return cls._is_affirmative_chart_followup(question) and cls._answer_describes_chart(answer)
+
+    @staticmethod
+    def _answer_describes_chart(answer: str) -> bool:
+        text = (answer or "").lower()
+        if not text:
+            return False
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in _CHART_ANSWER_PATTERNS)
+
+    @staticmethod
+    def _requested_chart_mark(question: str, answer: str, temporal_col: Optional[str]) -> str:
+        combined = f"{(question or '').lower()} {(answer or '').lower()}"
+        if re.search(r"\bpie\s*(?:chart|graph|plot)?\b", combined) or re.search(
+            r"\b(?:donut|doughnut)\s+(?:chart|graph|plot)\b", combined
+        ):
+            return "arc"
+        if re.search(r"\b(?:bar|column)\s+(?:chart|graph|plot)\b", combined):
+            return "bar"
+        if re.search(r"\bline\s+(?:chart|graph|plot)\b", combined):
+            return "line"
+        if re.search(r"\btrends?\s+over\s+time\b", combined) or re.search(r"\bsales\s+trends?\b", combined):
+            return "line"
+        if temporal_col and re.search(r"\btrend\b", combined):
+            return "line"
+        if temporal_col:
+            return "line"
+        return "bar"
+
+    @staticmethod
+    def _parse_top_n_from_text(text: str) -> Optional[int]:
+        if not text:
+            return None
+        match = re.search(r"\btop\s+(\d{1,2})\b", text, re.IGNORECASE)
+        if not match:
+            return None
+        return max(1, min(int(match.group(1)), 25))
+
+    @staticmethod
+    def _extract_answer_list_names(text: str) -> list[str]:
+        if not text:
+            return []
+
+        names: list[str] = []
+        list_started = False
+        stop_markers = (
+            "next step",
+            "suggested question",
+            "would you like",
+            "want to compare",
+            "interested in",
+            "can you display",
+            "you may want",
+        )
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if names:
+                    list_started = True
+                continue
+
+            lowered = line.lower()
+            if any(marker in lowered for marker in stop_markers):
+                break
+
+            if re.search(r"\binclude:\s*$|\bare:\s*$|\bstores include\b|\bin the chart are:\s*$", line, re.IGNORECASE):
+                list_started = True
+                continue
+
+            cleaned = re.sub(r"^(?:[-*•]|\d+\.)\s*", "", line)
+            if re.match(r"^(?P<name>.+?)\s*[:|-]\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$", cleaned):
+                match = re.match(r"^(?P<name>.+?)\s*[:|-]\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$", cleaned)
+                names.append(match.group("name").strip())
+                list_started = True
+                continue
+
+            looks_like_store = (
+                list_started
+                or "ltd" in lowered
+                or lowered.startswith("pt-")
+                or "shoppers stop" in lowered
+                or "fresco" in lowered
+            )
+            if looks_like_store and 4 <= len(cleaned) <= 120 and not cleaned.endswith("?"):
+                if not re.match(r"^(the|this|you|it|that)\b", lowered):
+                    names.append(cleaned)
+                    list_started = True
+
+        return names
+
+    @classmethod
+    def _should_infer_chart(cls, question: str, answer: str) -> bool:
+        return cls._should_show_charts(question, answer)
+
+    def _parse_trend_rows_from_text(self, text: str) -> list[list[dict]]:
+        if not text:
+            return []
+
+        trend_line = re.compile(
+            r"^(?P<period>(?:[A-Za-z]{3}-\d{4})|(?:\d{4}-\d{2}(?:-\d{2})?))"
+            r"\s*:\s*"
+            r"(?P<qty>[\d,]+)\s*qty"
+            r"(?:,\s*[₹$€]?\s*(?P<amount>[\d,]+(?:\.\d+)?))?",
+            re.IGNORECASE,
+        )
+        rows: list[dict] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip().lstrip("-•* ").strip()
+            if not line:
+                continue
+            match = trend_line.match(line)
+            if not match:
+                continue
+            row = {
+                "period": match.group("period"),
+                "quantity": int(match.group("qty").replace(",", "")),
+            }
+            amount = match.group("amount")
+            if amount:
+                row["sales_amount"] = float(amount.replace(",", ""))
+            rows.append(row)
+
+        return [self._normalize_row_values(rows)] if len(rows) >= 2 else []
+
+    def _parse_list_tables_from_text(self, text: str) -> list[list[dict]]:
+        rows: list[dict] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            cleaned = re.sub(r"^(?:[-*•]|\d+\.)\s*", "", line)
+            match = re.match(r"^(?P<name>.+?)\s*[:|-]\s*(?P<value>-?[\d,]+(?:\.\d+)?)\s*$", cleaned)
+            if not match:
+                continue
+            rows.append(
+                {
+                    "name": match.group("name").strip(),
+                    "value": float(match.group("value").replace(",", "")),
+                }
+            )
+
+        return [self._normalize_row_values(rows)] if len(rows) >= 2 else []
+
+    def _find_value_column(self, columns: list[str], rows: list[dict]) -> Optional[str]:
+        numeric_cols = [col for col in columns if self._column_is_mostly_numeric(rows, col)]
+        if not numeric_cols:
+            return None
+        return next(
+            (
+                col
+                for col in numeric_cols
+                if any(token in col.lower() for token in ("qty", "quantity", "sales", "volume", "sold", "amount", "total", "value", "count"))
+            ),
+            numeric_cols[0],
+        )
+
+    def _find_category_column(self, columns: list[str], rows: list[dict], value_col: Optional[str]) -> Optional[str]:
+        category_cols = [col for col in columns if col != value_col and not self._column_is_mostly_numeric(rows, col)]
+        if not category_cols:
+            category_cols = [col for col in columns if col != value_col]
+        if not category_cols:
+            return None
+        return next(
+            (
+                col
+                for col in category_cols
+                if any(token in col.lower() for token in ("store", "site", "name", "customer", "product", "sku", "region"))
+            ),
+            category_cols[0],
+        )
+
+    @staticmethod
+    def _column_is_mostly_numeric(rows: list[dict], column: str) -> bool:
+        checked = 0
+        numeric = 0
+        for row in rows[:50]:
+            value = row.get(column)
+            if value is None or value == "":
+                continue
+            checked += 1
+            if isinstance(value, (int, float)):
+                numeric += 1
+                continue
+            try:
+                float(str(value).replace(",", ""))
+                numeric += 1
+            except ValueError:
+                pass
+        return checked > 0 and numeric / checked >= 0.8
+
+    def _filter_rows_by_names(self, rows: list[dict], category_col: str, names: list[str]) -> list[dict]:
+        if not rows or not names or not category_col:
+            return rows
+
+        filtered: list[dict] = []
+        lowered_names = [name.lower() for name in names]
+        for row in rows:
+            value = str(row.get(category_col, "")).strip().lower()
+            if not value:
+                continue
+            if any(name in value or value in name for name in lowered_names):
+                filtered.append(row)
+
+        return filtered
+
+    def _prepare_chart_rows(self, tables: list[list[dict]], question: str, answer: str) -> Optional[list[dict]]:
+        if not tables:
+            return None
+
+        best = max(tables, key=len)
+        if not best:
+            return None
+
+        columns = list(best[0].keys())
+        value_col = self._find_value_column(columns, best)
+        category_col = self._find_category_column(columns, best, value_col)
+        answer_names = self._extract_answer_list_names(answer)
+        top_n = self._parse_top_n_from_text(f"{question} {answer}")
+
+        rows = list(best)
+        if answer_names and category_col:
+            matched = self._filter_rows_by_names(rows, category_col, answer_names)
+            if matched:
+                rows = matched
+            elif value_col:
+                # Preserve answer order when names are listed without numeric values in the reply.
+                ordered = []
+                for name in answer_names:
+                    for row in rows:
+                        value = str(row.get(category_col, "")).strip().lower()
+                        if name.lower() in value or value in name.lower():
+                            ordered.append(row)
+                            break
+                if ordered:
+                    rows = ordered
+
+        has_temporal = any(self._looks_like_temporal_column(col) for col in columns)
+        category_values = [str(row.get(category_col, "")).strip() for row in rows if category_col]
+        rows_are_monthly = bool(category_values) and all(
+            self._is_month_label(value) for value in category_values
+        )
+        if value_col and not has_temporal and not rows_are_monthly:
+            rows = sorted(
+                rows,
+                key=lambda row: float(str(row.get(value_col, 0)).replace(",", "") or 0),
+                reverse=True,
+            )
+
+        if top_n:
+            rows = rows[:top_n]
+        elif self._requested_chart_mark(question, answer, None) == "arc":
+            rows = rows[:10]
+
+        return rows if rows else None
+
+    def _collect_chart_payloads(self, value, specs: list, tables: list, depth: int = 0) -> None:
+        if depth > 14:
+            return
+
+        if isinstance(value, dict):
+            for key in (
+                "vegaLiteSpec",
+                "vega_lite_spec",
+                "report_spec",
+                "visual_spec",
+                "chart_spec",
+                "spec",
+            ):
+                nested = value.get(key)
+                if self._is_vega_lite_spec(nested):
+                    specs.append(nested)
+
+            if "report_specs" in value:
+                report_specs = value["report_specs"]
+                if isinstance(report_specs, list):
+                    for item in report_specs:
+                        if self._is_vega_lite_spec(item):
+                            specs.append(item)
+                        elif isinstance(item, dict) and self._is_vega_lite_spec(item.get("spec")):
+                            specs.append(item["spec"])
+                        elif isinstance(item, dict) and self._is_pbir_visual_spec(item):
+                            specs.append(item)
+
+            for key, nested in value.items():
+                key_lower = str(key).lower()
+                if "report_spec" in key_lower and isinstance(nested, (dict, list, str)):
+                    self._collect_chart_payloads(nested, specs, tables, depth + 1)
+
+            if self._is_pbir_visual_spec(value):
+                specs.append(value)
+
+            for key in ("data", "rows", "results", "records", "values", "items", "preview", "table", "dataset"):
+                nested = value.get(key)
+                if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                    tables.append(nested)
+
+            columns = value.get("columns")
+            row_values = value.get("rows")
+            if isinstance(columns, list) and isinstance(row_values, list) and columns and row_values:
+                materialized = []
+                for row in row_values:
+                    if isinstance(row, dict):
+                        materialized.append(row)
+                    elif isinstance(row, list):
+                        materialized.append(
+                            {
+                                str(columns[index]): row[index]
+                                for index in range(min(len(columns), len(row)))
+                            }
+                        )
+                if materialized:
+                    tables.append(materialized)
+
+            for nested in value.values():
+                self._collect_chart_payloads(nested, specs, tables, depth + 1)
+            return
+
+        if isinstance(value, list):
+            if value and isinstance(value[0], dict):
+                if self._is_vega_lite_spec(value[0]):
+                    specs.extend(item for item in value if self._is_vega_lite_spec(item))
+                elif len(value) >= 2:
+                    tables.append(value)
+            elif value and isinstance(value[0], list):
+                header = value[0]
+                if header and all(isinstance(item, str) for item in header):
+                    materialized = []
+                    for row in value[1:]:
+                        if isinstance(row, list):
+                            materialized.append(
+                                {
+                                    header[index]: row[index]
+                                    for index in range(min(len(header), len(row)))
+                                }
+                            )
+                    if materialized:
+                        tables.append(materialized)
+            for item in value:
+                self._collect_chart_payloads(item, specs, tables, depth + 1)
+            return
+
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return
+            self._collect_chart_payloads(parsed, specs, tables, depth + 1)
+
+    def _iter_step_payloads(self, steps):
+        if not steps:
+            return
+
+        for step in steps.data:
+            details = getattr(step, "step_details", None)
+            if not details:
+                continue
+
+            yield details.model_dump() if hasattr(details, "model_dump") else details
+
+            tool_calls = getattr(details, "tool_calls", None) or []
+            for tool_call in tool_calls:
+                for attr in ("output", "function"):
+                    value = getattr(tool_call, attr, None)
+                    if value is not None:
+                        yield value
+                if hasattr(tool_call, "model_dump"):
+                    yield tool_call.model_dump()
+
+    def _extract_raw_tables_from_steps(self, steps) -> list[list[dict]]:
+        tables: list[list[dict]] = []
+        if not steps:
+            return tables
+
+        try:
+            for payload in self._iter_step_payloads(steps):
+                scratch_specs: list = []
+                scratch_tables: list = []
+                self._collect_chart_payloads(payload, scratch_specs, scratch_tables)
+                for table in scratch_tables:
+                    if table and isinstance(table[0], dict):
+                        tables.append(table)
+        except Exception as exc:
+            print(f"⚠️ Warning: Could not extract chart tables: {exc}")
+
+        unique_tables: list[list[dict]] = []
+        seen = set()
+        for table in tables:
+            signature = tuple(sorted(table[0].keys()))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            unique_tables.append(table)
+        return unique_tables
+
+    def _extract_vega_specs_from_steps(self, steps) -> list[dict]:
+        specs: list[dict] = []
+        if not steps:
+            return specs
+
+        try:
+            for payload in self._iter_step_payloads(steps):
+                scratch_tables: list = []
+                self._collect_chart_payloads(payload, specs, scratch_tables)
+        except Exception as exc:
+            print(f"⚠️ Warning: Could not extract Vega-Lite specs: {exc}")
+
+        unique_specs: list[dict] = []
+        seen = set()
+        for spec in specs:
+            signature = json.dumps(spec, sort_keys=True, default=str)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            unique_specs.append(spec)
+        return unique_specs
+
+    def _extract_chart_images_from_messages(self, messages, run_id: Optional[str] = None) -> list[dict]:
+        images: list[dict] = []
+        if not messages:
+            return images
+
+        try:
+            for msg in messages.data:
+                if msg.role != "assistant":
+                    continue
+                if run_id is not None and getattr(msg, "run_id", None) != run_id:
+                    continue
+
+                for block in getattr(msg, "content", []) or []:
+                    block_type = getattr(block, "type", None)
+                    if block_type == "image_url":
+                        image_url = getattr(getattr(block, "image_url", None), "url", None)
+                        if image_url:
+                            images.append({"image_url": image_url})
+                    elif block_type == "image_file":
+                        file_id = getattr(getattr(block, "image_file", None), "file_id", None)
+                        if file_id:
+                            images.append({"image_url": f"openai-file://{file_id}"})
+        except Exception as exc:
+            print(f"⚠️ Warning: Could not extract chart images: {exc}")
+
+        return images
+
+    @staticmethod
+    def _looks_like_temporal_column(name: str) -> bool:
+        lowered = name.lower()
+        return any(
+            token in lowered
+            for token in ("date", "time", "day", "month", "year", "week", "period", "timestamp")
+        )
+
+    @staticmethod
+    def _is_month_label(value: str) -> bool:
+        lowered = (value or "").strip().lower()
+        if not lowered:
+            return False
+        month_names = (
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+            "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        )
+        return lowered in month_names or any(lowered.startswith(name) for name in month_names)
+
+    @staticmethod
+    def _column_is_numeric(rows: list[dict], column: str) -> bool:
+        checked = 0
+        numeric = 0
+        for row in rows[:20]:
+            value = row.get(column)
+            if value is None or value == "":
+                continue
+            checked += 1
+            if isinstance(value, (int, float)):
+                numeric += 1
+                continue
+            try:
+                float(str(value).replace(",", ""))
+                numeric += 1
+            except ValueError:
+                return False
+        return checked > 0 and numeric == checked
+
+    def _infer_chart_spec(self, question: str, answer: str, rows: list[dict]) -> Optional[dict]:
+        if not rows or not isinstance(rows[0], dict):
+            return None
+
+        if not self._should_infer_chart(question, answer):
+            return None
+
+        rows = self._normalize_row_values(rows)
+        columns = list(rows[0].keys())
+        if not columns:
+            return None
+
+        temporal_cols = [col for col in columns if self._looks_like_temporal_column(col)]
+        numeric_cols = [col for col in columns if self._column_is_mostly_numeric(rows, col)]
+        category_cols = [col for col in columns if col not in numeric_cols]
+        series_cols = [col for col in category_cols if col not in temporal_cols]
+
+        if not numeric_cols:
+            return None
+
+        value_col = next(
+            (col for col in numeric_cols if any(token in col.lower() for token in ("stock", "qty", "quantity", "total", "amount", "value", "count", "sales", "volume", "sold"))),
+            numeric_cols[0],
+        )
+        temporal_col = temporal_cols[0] if temporal_cols else None
+        series_col = None
+        if series_cols:
+            preferred = next(
+                (col for col in series_cols if any(token in col.lower() for token in ("sku", "store", "product", "category", "region", "name", "customer"))),
+                series_cols[0],
+            )
+            cardinality = len({str(row.get(preferred)) for row in rows[:200]})
+            if 1 < cardinality <= 25:
+                series_col = preferred
+
+        mark_type = self._requested_chart_mark(question, answer, temporal_col)
+
+        if mark_type == "arc" and len(rows) < 2:
+            return None
+
+        encoding = {}
+        if mark_type == "arc":
+            category_col = series_col or next(
+                (col for col in category_cols if col != value_col),
+                category_cols[0] if category_cols else columns[0],
+            )
+            encoding = {
+                "theta": {"field": value_col, "type": "quantitative", "aggregate": "sum", "stack": True},
+                "color": {"field": category_col, "type": "nominal", "title": self._humanize_field_name(category_col)},
+                "tooltip": [
+                    {"field": category_col, "type": "nominal", "title": "Store"},
+                    {"field": value_col, "type": "quantitative", "aggregate": "sum", "title": "Sales Qty", "format": ",.0f"},
+                ],
+            }
+        else:
+            x_field = temporal_col or series_col or (category_cols[0] if category_cols else columns[0])
+            if temporal_col:
+                period_values = [str(row.get(temporal_col, "")) for row in rows[:20]]
+                if period_values and all(
+                    re.match(r"^[A-Za-z]{3}-\d{4}$", value) for value in period_values if value
+                ):
+                    x_type = "ordinal"
+                else:
+                    x_type = "temporal"
+            elif all(self._is_month_label(str(row.get(x_field, ""))) for row in rows[:20]):
+                x_type = "ordinal"
+            else:
+                x_type = "nominal"
+            encoding = {
+                "x": {"field": x_field, "type": x_type, "title": self._humanize_field_name(x_field)},
+                "y": {"field": value_col, "type": "quantitative", "title": self._humanize_field_name(value_col), "aggregate": "sum"},
+            }
+            tooltip_fields = [
+                {"field": x_field, "type": x_type, "title": self._humanize_field_name(x_field)},
+                {"field": value_col, "type": "quantitative", "title": self._humanize_field_name(value_col)},
+            ]
+            for extra_col in numeric_cols:
+                if extra_col != value_col:
+                    tooltip_fields.append(
+                        {"field": extra_col, "type": "quantitative", "title": self._humanize_field_name(extra_col)}
+                    )
+            encoding["tooltip"] = tooltip_fields
+            if series_col and temporal_col:
+                encoding["color"] = {"field": series_col, "type": "nominal", "title": series_col}
+
+        title = None
+
+        return {
+            "title": title,
+            "kind": "vega-lite",
+            "spec": self._sanitize_vega_spec({
+                "$schema": VEGA_LITE_SCHEMA,
+                "width": 400,
+                "height": 320,
+                "data": {"values": rows[:200]},
+                "mark": (
+                    {"type": "arc", "innerRadius": 48, "outerRadius": 120, "stroke": "#fff", "strokeWidth": 1}
+                    if mark_type == "arc"
+                    else {"type": mark_type, "point": mark_type == "line"}
+                ),
+                "encoding": encoding,
+            }),
+        }
+
+    def _merge_spec_with_data(self, spec: dict, rows: Optional[list[dict]]) -> dict:
+        merged = json.loads(json.dumps(spec, default=str))
+        if rows:
+            sanitized_rows = self._normalize_row_values(rows)
+            data_section = merged.get("data")
+            if isinstance(data_section, dict):
+                if "values" not in data_section and "url" not in data_section:
+                    merged["data"] = {**data_section, "values": sanitized_rows}
+                elif "values" in data_section:
+                    merged["data"]["values"] = sanitized_rows
+            else:
+                merged["data"] = {"values": sanitized_rows}
+        return self._sanitize_vega_spec(merged)
+
+    def _extract_charts(
+        self,
+        steps,
+        messages,
+        run_id: Optional[str],
+        question: str,
+        answer: str,
+        sql_previews=None,
+    ) -> list[dict]:
+        """
+        Charts are shown when the user asks for one, or affirms a chart offer (e.g. "yes")
+        and the agent reply describes a chart.
+        """
+        if not self._should_show_charts(question, answer):
+            return []
+
+        charts: list[dict] = []
+        tables = self._extract_all_row_tables(steps, sql_previews, messages, answer, question)
+        specs = self._extract_vega_specs_from_steps(steps)
+        pbir_specs = [spec for spec in specs if self._is_pbir_visual_spec(spec)]
+        vega_specs = [spec for spec in specs if self._is_vega_lite_spec(spec)]
+        largest_table = max(tables, key=len) if tables else None
+
+        for index, spec in enumerate(vega_specs, start=1):
+            table = largest_table
+            merged_spec = self._merge_spec_with_data(spec, table)
+            title = merged_spec.get("title")
+            if isinstance(title, dict):
+                title = title.get("text")
+            charts.append(
+                {
+                    "id": f"chart-{index}",
+                    "title": title or f"Chart {index}",
+                    "kind": "vega-lite",
+                    "spec": merged_spec,
+                }
+            )
+
+        for index, pbir_spec in enumerate(pbir_specs, start=1):
+            table = largest_table
+            if not table:
+                continue
+            converted = self._sanitize_vega_spec(self._pbir_to_vega_spec(pbir_spec, table) or {})
+            if not converted.get("encoding"):
+                continue
+            charts.append(
+                {
+                    "id": f"pbir-chart-{index}",
+                    "title": converted.get("title") or f"Chart {index}",
+                    "kind": "vega-lite",
+                    "spec": converted,
+                }
+            )
+
+        for index, image in enumerate(self._extract_chart_images_from_messages(messages, run_id), start=1):
+            charts.append(
+                {
+                    "id": f"image-{index}",
+                    "title": "Chart",
+                    "kind": "image",
+                    "image_url": image["image_url"],
+                }
+            )
+
+        if not charts and self._should_show_charts(question, answer):
+            prepared_rows = self._prepare_chart_rows(tables, question, answer)
+            if not prepared_rows:
+                for table in sorted(tables, key=len, reverse=True):
+                    prepared_rows = self._prepare_chart_rows([table], question, answer)
+                    if prepared_rows:
+                        break
+            if prepared_rows:
+                inferred = self._infer_chart_spec(question, answer, prepared_rows)
+                if inferred:
+                    charts.append({"id": "chart-inferred", **inferred})
+
+        print(
+            f"📊 Charts extracted: {len(charts)} "
+            f"(tables={len(tables)}, vega_specs={len(vega_specs)}, pbir_specs={len(pbir_specs)})"
+        )
+        return charts
+
     def _run_question(
         self,
         question: str,
@@ -390,11 +1558,29 @@ class FabricDataAgentClient:
                     sql_analysis["queries"] = regex_queries
                     sql_analysis["data_retrieval_query"] = regex_queries[0]
 
+        charts = []
+        answer_text = "\n".join(responses) if responses else "No response received from the data agent."
+        print("\n" + "=" * 80, flush=True)
+        print(f"AGENT ANSWER for: {question}", flush=True)
+        print("-" * 80, flush=True)
+        print(answer_text, flush=True)
+        print("=" * 80 + "\n", flush=True)
+        if steps:
+            charts = self._extract_charts(
+                steps,
+                messages,
+                run.id,
+                question,
+                answer_text,
+                sql_analysis.get("data_previews"),
+            )
+
         self._maybe_cleanup_thread(client, thread, preserve_thread=preserve_thread)
 
         return {
             "question": question,
-            "answer": "\n".join(responses) if responses else "No response received from the data agent.",
+            "answer": answer_text,
+            "charts": charts,
             "run_status": run.status,
             "reframed_query": reframed_query,
             "sql_queries": sql_analysis["queries"],
@@ -436,6 +1622,7 @@ class FabricDataAgentClient:
                 "sql_queries": [],
                 "sql_data_previews": [],
                 "data_retrieval_query": None,
+                "charts": [],
                 "success": False,
                 "error": str(e),
                 "timestamp": time.time(),
@@ -1155,6 +2342,9 @@ def is_retryable_fabric_error(message: str) -> bool:
     return (
         "itemnotfound" in lowered
         or "error code: 404" in lowered
+        or "error code: 403" in lowered
+        or "insufficientprivileges" in lowered
+        or ("user id" in lowered and "don't match" in lowered)
         or "could not found the requested item" in lowered
     )
 

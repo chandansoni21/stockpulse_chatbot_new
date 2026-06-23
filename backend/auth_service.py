@@ -327,6 +327,14 @@ def login_with_auth_code(code: str, redirect_uri: str, code_verifier: str) -> di
 def acquire_fabric_token() -> StoredAccessToken:
     global _active_fabric_token_mode
 
+    # Web sign-in must drive Fabric calls. Mixing az-login / service-principal tokens
+    # with a user's browser token causes Fabric "User ID's don't match" (403) errors.
+    if is_session_valid():
+        session = read_session() or {}
+        if session.get("access_token"):
+            _active_fabric_token_mode = "delegated"
+            return _acquire_delegated_fabric_token()
+
     if FABRIC_TOKEN_MODE == "service_principal":
         _active_fabric_token_mode = "service_principal"
         return _acquire_service_principal_fabric_token()

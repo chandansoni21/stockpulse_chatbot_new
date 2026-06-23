@@ -32,7 +32,7 @@ function parseTableLine(line) {
 }
 
 function parseHeading(line) {
-  const match = line.trim().match(/^(#{1,3})\s+(.+)$/);
+  const match = line.trim().match(/^(#{1,6})\s+(.+)$/);
   if (!match) return null;
   return { level: match[1].length, content: match[2].trim() };
 }

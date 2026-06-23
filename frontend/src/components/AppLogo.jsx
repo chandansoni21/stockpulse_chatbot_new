@@ -1,4 +1,4 @@
-const AppLogo = ({ className = 'h-9 w-9' }) => (
+const AppLogo = ({ className = 'block h-9 w-9 shrink-0' }) => (
   <svg
     className={className}
     viewBox="0 0 40 40"

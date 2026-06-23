@@ -12,13 +12,15 @@ export function setStoredAgentId(agentId) {
   }
 }
 
-export function createWelcomeMessage(agentName) {
+export function createWelcomeMessage(agentName, { suggestionsLoading = false } = {}) {
   return {
     id: crypto.randomUUID(),
     role: 'assistant',
+    isWelcome: true,
     text: `Hi! You're chatting with ${agentName}. Ask me anything about your data.`,
     animate: false,
     typewriter: false,
     suggestions: [],
+    suggestionsLoading,
   };
 }

@@ -79,6 +79,66 @@ select {
     border-spacing: 0;
   }
 
+  .chart-embed-root {
+    text-align: left;
+  }
+
+  .chart-card {
+    @apply overflow-hidden rounded-2xl border border-slate-200/90 bg-gradient-to-b from-white to-slate-50/60 shadow-sm;
+  }
+
+  .chart-card-head {
+    @apply flex items-center justify-between gap-3 border-b border-slate-100 bg-white/90 px-3 py-2.5 sm:px-4;
+  }
+
+  .chart-card-icon {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded-lg bg-brand-50 text-brand-600;
+  }
+
+  .chart-card-body {
+    @apply w-full bg-white px-2 py-2 sm:px-3 sm:py-3;
+  }
+
+  .chart-card-foot {
+    @apply border-t border-slate-100 bg-slate-50/80 px-3 py-2 text-[11px] leading-relaxed text-slate-500 sm:px-4 sm:text-xs;
+  }
+
+  .chart-card-body .vega-embed {
+    display: block;
+    width: 100% !important;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  .chart-card-body .vega-embed summary {
+    display: none;
+  }
+
+  .chart-card-body .vega-embed svg {
+    display: block;
+    max-width: 100%;
+    margin: 0 auto;
+  }
+
+  .chart-embed-root .vega-embed {
+    display: block;
+    width: fit-content;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+    text-align: left;
+  }
+
+  .chart-embed-root .vega-embed summary,
+  .chart-embed-root .vega-embed > div,
+  .chart-embed-root .vega-embed svg {
+    display: block;
+    width: fit-content;
+    max-width: none;
+    margin: 0;
+  }
+
   .message-enter-assistant {
     animation: message-enter 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards;
   }
@@ -118,6 +178,17 @@ select {
   to {
     opacity: 1;
     transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
