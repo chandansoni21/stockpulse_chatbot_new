@@ -31,3 +31,7 @@ export function isFabricAccessMessage(text) {
     || normalized.includes("user id")
   );
 }
+
+export function isLoginRequiredMessage(text) {
+  return /microsoft login required/i.test(normalizeAssistantText(text));
+}

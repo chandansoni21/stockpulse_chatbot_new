@@ -3,12 +3,16 @@ import App from './App';
 import {
   clearAuthExpires,
   hasSwitchedMicrosoftAccount,
-  isAuthExpiredLocally,
   setAuthExpires,
   setLastUserEmail,
 } from './utils/authStorage';
 import { setStoredAgentId } from './utils/agentStorage';
 import { API_URL } from './utils/apiConfig';
+import {
+  apiFetch,
+  clearAuthSessionId,
+  setAuthSessionId,
+} from './utils/apiFetch';
 import {
   readLoginCallback,
   startLoginRedirect,
@@ -16,7 +20,7 @@ import {
 } from './utils/microsoftAuth';
 
 async function postCodeLogin(callback) {
-  const response = await fetch(`${API_URL}/auth/login/code`, {
+  const response = await apiFetch(`${API_URL}/auth/login/code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -43,6 +47,7 @@ function Root() {
 
   const applyAuthStatus = useCallback((data) => {
     if (data?.session_days) setSessionDays(data.session_days);
+    if (data?.session_id) setAuthSessionId(data.session_id);
     if (data?.authenticated) {
       if (hasSwitchedMicrosoftAccount(data.user_email)) {
         setStoredAgentId(null);
@@ -54,13 +59,14 @@ function Root() {
       setLoginError(null);
     } else {
       clearAuthExpires();
+      clearAuthSessionId();
       setAuthenticated(false);
       setUserEmail(null);
     }
   }, []);
 
   const checkAuth = useCallback(async () => {
-    const response = await fetch(`${API_URL}/auth/status`);
+    const response = await apiFetch(`${API_URL}/auth/status`);
     if (!response.ok) throw new Error('Could not verify login status.');
     const data = await response.json();
     applyAuthStatus(data);
@@ -79,12 +85,11 @@ function Root() {
         }
       } catch (exception) {
         if (!active) return;
+        clearAuthExpires();
+        clearAuthSessionId();
+        setAuthenticated(false);
+        setUserEmail(null);
         setLoginError(exception.message || 'Microsoft login failed.');
-        if (!isAuthExpiredLocally()) {
-          setAuthenticated(true);
-        } else {
-          setAuthenticated(false);
-        }
       } finally {
         if (active) {
           setAuthChecked(true);
@@ -100,6 +105,7 @@ function Root() {
   const handleLogin = async () => {
     setLoginLoading(true);
     setLoginError(null);
+    clearAuthSessionId();
     try {
       await startLoginRedirect();
     } catch (exception) {
@@ -110,11 +116,12 @@ function Root() {
 
   const handleLogout = useCallback(async () => {
     try {
-      await fetch(`${API_URL}/auth/logout`, { method: 'POST' });
+      await apiFetch(`${API_URL}/auth/logout`, { method: 'POST' });
     } catch {
       // Ignore network errors during logout.
     }
     clearAuthExpires();
+    clearAuthSessionId();
     setAuthenticated(false);
     setUserEmail(null);
     setLoginError(null);
@@ -123,6 +130,7 @@ function Root() {
 
   const handleSessionExpired = useCallback(() => {
     clearAuthExpires();
+    clearAuthSessionId();
     setAuthenticated(false);
     setUserEmail(null);
     setLoginError(null);

@@ -1,4 +1,5 @@
 import { API_URL } from './apiConfig';
+import { apiFetch } from './apiFetch';
 
 export async function fetchAgentSuggestions(agentId, { forceRefresh = false, timeout = 120 } = {}) {
   const params = new URLSearchParams();
@@ -8,7 +9,7 @@ export async function fetchAgentSuggestions(agentId, { forceRefresh = false, tim
   const query = params.toString();
   const url = `${API_URL}/agents/${encodeURIComponent(agentId)}/suggestions${query ? `?${query}` : ''}`;
 
-  const response = await fetch(url);
+  const response = await apiFetch(url);
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.detail || 'Could not load suggested questions.');
@@ -19,7 +20,7 @@ export async function fetchAgentSuggestions(agentId, { forceRefresh = false, tim
 }
 
 export async function fetchFollowupSuggestions(agentId, exchanges, { timeout = 90 } = {}) {
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_URL}/agents/${encodeURIComponent(agentId)}/suggestions/followup`,
     {
       method: 'POST',

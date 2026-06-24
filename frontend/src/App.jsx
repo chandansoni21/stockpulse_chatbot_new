@@ -15,8 +15,9 @@ import { fetchChatHistory, saveChatHistory } from './utils/chatHistoryApi';
 import { fetchAgentSuggestions, fetchFollowupSuggestions } from './utils/agentSuggestionsApi';
 import { finalizePausedMessages, isWelcomeOnlyChat } from './utils/chatMessages';
 import { getLastTwoExchanges } from './utils/suggestQuestions';
-import { isFabricAccessMessage, normalizeAssistantText } from './utils/chatErrors';
+import { isFabricAccessMessage, isLoginRequiredMessage, normalizeAssistantText } from './utils/chatErrors';
 import { API_URL } from './utils/apiConfig';
+import { apiFetch } from './utils/apiFetch';
 import WelcomeScreen from './components/WelcomeScreen';
 
 const REQUEST_TIMEOUT = 300;
@@ -145,7 +146,7 @@ function App({
   const handleLogout = async () => {
     pauseActiveChatRequest();
     try {
-      await fetch(`${API_URL}/auth/logout`, { method: 'POST' });
+      await apiFetch(`${API_URL}/auth/logout`, { method: 'POST' });
     } catch {
       // Still clear local session if the server is unreachable.
     }
@@ -217,7 +218,7 @@ function App({
 
   const loadAgents = useCallback(async () => {
     try {
-      const response = await fetch(`${API_URL}/agents`);
+      const response = await apiFetch(`${API_URL}/agents`);
       if (handleAuthFailure(response)) return;
       if (!response.ok) throw new Error('Could not load agents.');
       const data = await response.json();
@@ -427,7 +428,7 @@ function App({
     const agentIdForRequest = selectedAgentId;
 
     try {
-      const response = await fetch(`${API_URL}/chat`, {
+      const response = await apiFetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -460,6 +461,12 @@ function App({
 
       const answerText = normalizeAssistantText(data.answer ?? 'No answer returned.');
       const isError = data.success === false;
+
+      if (isError && isLoginRequiredMessage(answerText)) {
+        handleAuthFailure({ status: 401 });
+        return;
+      }
+
       const charts = Array.isArray(data.charts) ? data.charts : [];
       const hasCharts = charts.length > 0;
       const assistantId = crypto.randomUUID();
@@ -598,7 +605,7 @@ function App({
     abortActiveChatRequest();
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/session/new`, {
+      const response = await apiFetch(`${API_URL}/session/new`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

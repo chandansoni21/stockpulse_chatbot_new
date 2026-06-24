@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import time
+import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,7 +44,26 @@ def _resolve_fabric_token_mode() -> str:
 
 FABRIC_TOKEN_MODE = _resolve_fabric_token_mode()
 SESSION_DAYS = int(os.getenv("AUTH_SESSION_DAYS", "7"))
-SESSION_FILE = Path(__file__).parent / ".auth_session.json"
+SESSIONS_FILE = Path(__file__).parent / ".auth_sessions.json"
+LEGACY_SESSION_FILE = Path(__file__).parent / ".auth_session.json"
+
+current_auth_session_id: ContextVar[Optional[str]] = ContextVar("current_auth_session_id", default=None)
+
+
+def set_request_session_id(session_id: Optional[str]):
+    return current_auth_session_id.set(session_id)
+
+
+def reset_request_session_id(token) -> None:
+    current_auth_session_id.reset(token)
+
+
+def get_request_session_id() -> Optional[str]:
+    return current_auth_session_id.get()
+
+
+def create_auth_session_id() -> str:
+    return str(uuid.uuid4())
 
 
 class StoredAccessToken:
@@ -103,6 +124,7 @@ def _session_payload(
     user_oid: Optional[str] = None,
     access_token: Optional[str] = None,
     token_expires_on: Optional[float] = None,
+    refresh_token: Optional[str] = None,
 ) -> dict:
     now = time.time()
     payload: dict[str, Any] = {
@@ -117,44 +139,87 @@ def _session_payload(
         payload["access_token"] = access_token
     if token_expires_on:
         payload["token_expires_on"] = token_expires_on
+    if refresh_token:
+        payload["refresh_token"] = refresh_token
     return payload
 
 
-def read_session() -> Optional[dict]:
-    if not SESSION_FILE.exists():
-        return None
-    try:
-        return json.loads(SESSION_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+def _read_all_sessions() -> dict[str, dict]:
+    if SESSIONS_FILE.exists():
+        try:
+            payload = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
 
 
-def is_session_valid() -> bool:
-    session = read_session()
+def _write_all_sessions(sessions: dict[str, dict]) -> None:
+    SESSIONS_FILE.write_text(json.dumps(sessions), encoding="utf-8")
+
+
+def _purge_expired_sessions(sessions: dict[str, dict]) -> dict[str, dict]:
+    now = time.time()
+    active = {
+        session_id: session
+        for session_id, session in sessions.items()
+        if now < float(session.get("expires_at", 0))
+    }
+    if len(active) != len(sessions):
+        _write_all_sessions(active)
+    return active
+
+
+def read_session(session_id: Optional[str] = None) -> Optional[dict]:
+    resolved_id = session_id or get_request_session_id()
+    if not resolved_id:
+        return None
+
+    sessions = _purge_expired_sessions(_read_all_sessions())
+    return sessions.get(resolved_id)
+
+
+def is_session_valid(session_id: Optional[str] = None) -> bool:
+    session = read_session(session_id)
     if not session:
         return False
     return time.time() < float(session.get("expires_at", 0))
 
 
 def save_session(
+    session_id: str,
     user_email: Optional[str] = None,
     user_oid: Optional[str] = None,
     access_token: Optional[str] = None,
     token_expires_on: Optional[float] = None,
+    refresh_token: Optional[str] = None,
 ) -> dict:
+    existing = read_session(session_id) or {}
     payload = _session_payload(
-        user_email=user_email,
-        user_oid=user_oid,
-        access_token=access_token,
-        token_expires_on=token_expires_on,
+        user_email=user_email or existing.get("user_email"),
+        user_oid=user_oid or existing.get("user_oid"),
+        access_token=access_token or existing.get("access_token"),
+        token_expires_on=token_expires_on or existing.get("token_expires_on"),
+        refresh_token=refresh_token or existing.get("refresh_token"),
     )
-    SESSION_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    sessions = _purge_expired_sessions(_read_all_sessions())
+    sessions[session_id] = payload
+    _write_all_sessions(sessions)
     return payload
 
 
-def clear_session() -> None:
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
+def clear_session(session_id: Optional[str] = None) -> None:
+    resolved_id = session_id or get_request_session_id()
+    if not resolved_id:
+        return
+
+    sessions = _read_all_sessions()
+    if resolved_id not in sessions:
+        return
+
+    sessions.pop(resolved_id, None)
+    _write_all_sessions(sessions)
 
 
 def clear_service_principal_token() -> None:
@@ -234,39 +299,123 @@ def _acquire_default_credential_fabric_token() -> StoredAccessToken:
     return _default_credential_token
 
 
-def _acquire_delegated_fabric_token() -> StoredAccessToken:
-    if not is_session_valid():
-        raise PermissionError("Microsoft login required. Please sign in again.")
-
-    session = read_session() or {}
+def _access_token_valid(session: dict) -> bool:
     access_token = session.get("access_token")
     token_expires_on = float(session.get("token_expires_on", 0))
+    return bool(access_token) and time.time() < token_expires_on - 60
 
-    if not access_token or time.time() >= token_expires_on - 60:
+
+def _refresh_delegated_access_token(session_id: str) -> None:
+    session = read_session(session_id) or {}
+    refresh_token = session.get("refresh_token")
+    if not refresh_token:
         raise PermissionError("Microsoft login required. Please sign in again.")
 
+    token_url = f"https://login.microsoftonline.com/{AZURE_AUTHORITY}/oauth2/v2.0/token"
+    response = requests.post(
+        token_url,
+        data={
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": f"{FABRIC_SCOPE} openid profile offline_access",
+        },
+        timeout=30,
+    )
+    payload = response.json()
+    if response.status_code >= 400:
+        error = payload.get("error_description") or payload.get("error") or "Microsoft token refresh failed."
+        raise PermissionError(error)
+
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise PermissionError("Microsoft login required. Please sign in again.")
+
+    expires_in = int(payload.get("expires_in", 3600))
+    expires_on = time.time() + expires_in
+    save_session(
+        session_id,
+        user_email=session.get("user_email"),
+        user_oid=session.get("user_oid"),
+        access_token=access_token,
+        token_expires_on=expires_on,
+        refresh_token=payload.get("refresh_token") or refresh_token,
+    )
+
+
+def _ensure_delegated_access_token(session_id: str) -> dict:
+    session = read_session(session_id) or {}
+    if _access_token_valid(session):
+        return session
+
+    _refresh_delegated_access_token(session_id)
+    refreshed = read_session(session_id) or {}
+    if not _access_token_valid(refreshed):
+        raise PermissionError("Microsoft login required. Please sign in again.")
+    return refreshed
+
+
+def _acquire_delegated_fabric_token(session_id: Optional[str] = None) -> StoredAccessToken:
+    resolved_id = session_id or get_request_session_id()
+    if not is_session_valid(resolved_id):
+        raise PermissionError("Microsoft login required. Please sign in again.")
+
+    session = _ensure_delegated_access_token(resolved_id)
+    access_token = session.get("access_token")
+    token_expires_on = float(session.get("token_expires_on", 0))
     return StoredAccessToken(access_token, token_expires_on)
 
 
-def get_auth_status() -> dict:
-    session = read_session()
-    if not is_session_valid():
+def get_auth_status(session_id: Optional[str] = None) -> dict:
+    resolved_id = session_id or get_request_session_id()
+    if not resolved_id:
         return {
             "authenticated": False,
             "expires_at": None,
             "session_days": SESSION_DAYS,
         }
 
+    session = read_session(resolved_id)
+    if not is_session_valid(resolved_id) or not session:
+        return {
+            "authenticated": False,
+            "expires_at": None,
+            "session_days": SESSION_DAYS,
+        }
+
+    if not _access_token_valid(session):
+        if not session.get("refresh_token"):
+            return {
+                "authenticated": False,
+                "expires_at": None,
+                "session_days": SESSION_DAYS,
+            }
+        try:
+            _refresh_delegated_access_token(resolved_id)
+            session = read_session(resolved_id) or {}
+        except PermissionError:
+            return {
+                "authenticated": False,
+                "expires_at": None,
+                "session_days": SESSION_DAYS,
+            }
+
     return {
         "authenticated": True,
         "expires_at": session.get("expires_at"),
         "session_days": SESSION_DAYS,
         "user_email": session.get("user_email"),
+        "session_id": resolved_id,
         "fabric_token_mode": get_active_fabric_token_mode(),
     }
 
 
-def login_with_access_token(access_token: str, token_expires_on: Optional[float] = None) -> dict:
+def login_with_access_token(
+    access_token: str,
+    token_expires_on: Optional[float] = None,
+    session_id: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+) -> dict:
     user_email = _email_from_token(access_token)
     if not user_email:
         raise ValueError("Could not read user details from Microsoft token.")
@@ -276,11 +425,14 @@ def login_with_access_token(access_token: str, token_expires_on: Optional[float]
     if not expires_on or time.time() >= expires_on:
         raise ValueError("Microsoft token is expired. Please sign in again.")
 
+    resolved_id = session_id or create_auth_session_id()
     session = save_session(
+        resolved_id,
         user_email=user_email,
         user_oid=user_oid,
         access_token=access_token,
         token_expires_on=expires_on,
+        refresh_token=refresh_token,
     )
     return {
         "authenticated": True,
@@ -288,6 +440,8 @@ def login_with_access_token(access_token: str, token_expires_on: Optional[float]
         "token_expires_at": expires_on,
         "session_days": SESSION_DAYS,
         "user_email": user_email,
+        "user_oid": user_oid,
+        "session_id": resolved_id,
         "fabric_token_mode": get_active_fabric_token_mode(),
     }
 
@@ -313,7 +467,12 @@ def exchange_auth_code(code: str, redirect_uri: str, code_verifier: str) -> dict
     return payload
 
 
-def login_with_auth_code(code: str, redirect_uri: str, code_verifier: str) -> dict:
+def login_with_auth_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+    session_id: Optional[str] = None,
+) -> dict:
     token_payload = exchange_auth_code(code, redirect_uri, code_verifier)
     access_token = token_payload.get("access_token")
     if not access_token:
@@ -321,19 +480,26 @@ def login_with_auth_code(code: str, redirect_uri: str, code_verifier: str) -> di
 
     expires_in = int(token_payload.get("expires_in", 3600))
     expires_on = time.time() + expires_in
-    return login_with_access_token(access_token, expires_on)
+    return login_with_access_token(
+        access_token,
+        expires_on,
+        session_id=session_id,
+        refresh_token=token_payload.get("refresh_token"),
+    )
 
 
-def acquire_fabric_token() -> StoredAccessToken:
+def acquire_fabric_token(session_id: Optional[str] = None) -> StoredAccessToken:
     global _active_fabric_token_mode
+
+    resolved_id = session_id or get_request_session_id()
 
     # Web sign-in must drive Fabric calls. Mixing az-login / service-principal tokens
     # with a user's browser token causes Fabric "User ID's don't match" (403) errors.
-    if is_session_valid():
-        session = read_session() or {}
+    if is_session_valid(resolved_id):
+        session = read_session(resolved_id) or {}
         if session.get("access_token"):
             _active_fabric_token_mode = "delegated"
-            return _acquire_delegated_fabric_token()
+            return _acquire_delegated_fabric_token(resolved_id)
 
     if FABRIC_TOKEN_MODE == "service_principal":
         _active_fabric_token_mode = "service_principal"
@@ -346,30 +512,33 @@ def acquire_fabric_token() -> StoredAccessToken:
             return token
         except Exception as exc:
             logger.warning("Shared Fabric credential unavailable, using signed-in user token: %s", exc)
-            token = _acquire_delegated_fabric_token()
+            token = _acquire_delegated_fabric_token(resolved_id)
             _active_fabric_token_mode = "delegated"
             return token
 
     if FABRIC_TOKEN_MODE == "delegated":
         _active_fabric_token_mode = "delegated"
-        return _acquire_delegated_fabric_token()
+        return _acquire_delegated_fabric_token(resolved_id)
 
     _active_fabric_token_mode = "delegated"
-    return _acquire_delegated_fabric_token()
+    return _acquire_delegated_fabric_token(resolved_id)
 
 
-def get_authenticated_session() -> Optional[dict]:
-    session = read_session()
-    if not is_session_valid():
+def get_authenticated_session(session_id: Optional[str] = None) -> Optional[dict]:
+    resolved_id = session_id or get_request_session_id()
+    if not is_session_valid(resolved_id):
         return None
+
+    session = read_session(resolved_id) or {}
     return {
         "user_email": session.get("user_email"),
         "user_oid": session.get("user_oid"),
         "expires_at": session.get("expires_at"),
+        "session_id": resolved_id,
     }
 
 
-def logout() -> dict:
-    clear_session()
+def logout(session_id: Optional[str] = None) -> dict:
+    clear_session(session_id)
     clear_fabric_token_caches()
     return {"authenticated": False}

@@ -4,7 +4,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -20,9 +20,12 @@ from auth_service import (
     clear_fabric_token_caches,
     get_auth_status,
     get_authenticated_session,
+    get_request_session_id,
     login_with_access_token,
     login_with_auth_code,
     logout,
+    reset_request_session_id,
+    set_request_session_id,
 )
 from chat_history_db import (
     get_chat_history,
@@ -61,6 +64,26 @@ def reset_runtime_state() -> None:
     _session_threads.clear()
     clear_suggestion_cache()
     clear_fabric_token_caches()
+
+
+def reset_user_runtime_state(user_email: Optional[str], user_oid: Optional[str]) -> None:
+    """Clear cached Fabric clients and chat threads for one signed-in user."""
+    identities = []
+    if user_oid:
+        identities.append(str(user_oid).strip().lower())
+    if user_email:
+        identities.append(str(user_email).strip().lower())
+
+    for identity in identities:
+        if not identity or identity == "anonymous":
+            continue
+        prefix = f"{identity}:"
+        for key in list(_clients.keys()):
+            if key.startswith(prefix):
+                _clients.pop(key, None)
+        for key in list(_session_threads.keys()):
+            if key.startswith(prefix):
+                _session_threads.pop(key, None)
 
 
 def load_agents() -> list[dict]:
@@ -296,8 +319,18 @@ def _format_chat_response(result: dict, agent_id: str) -> dict:
 
 
 def require_authenticated():
-    if not get_auth_status()["authenticated"]:
+    if not get_auth_status(get_request_session_id())["authenticated"]:
         raise HTTPException(status_code=401, detail="Microsoft login required. Please sign in first.")
+
+
+@app.middleware("http")
+async def bind_auth_session(request: Request, call_next):
+    session_id = request.headers.get("x-auth-session-id")
+    token = set_request_session_id(session_id)
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_session_id(token)
 
 
 @app.on_event("startup")
@@ -308,15 +341,26 @@ async def startup() -> None:
 
 
 @app.get("/auth/status")
-async def auth_status():
-    return get_auth_status()
+async def auth_status(
+    x_auth_session_id: Optional[str] = Header(default=None, alias="X-Auth-Session-Id"),
+):
+    return get_auth_status(x_auth_session_id)
 
 
 @app.post("/auth/login/code")
-async def auth_login_code(request: CodeLoginRequest):
+async def auth_login_code(
+    request: CodeLoginRequest,
+    x_auth_session_id: Optional[str] = Header(default=None, alias="X-Auth-Session-Id"),
+):
     try:
-        reset_runtime_state()
-        return login_with_auth_code(request.code, request.redirect_uri, request.code_verifier)
+        result = login_with_auth_code(
+            request.code,
+            request.redirect_uri,
+            request.code_verifier,
+            session_id=None,
+        )
+        reset_user_runtime_state(result.get("user_email"), result.get("user_oid"))
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except Exception as exc:
@@ -324,10 +368,18 @@ async def auth_login_code(request: CodeLoginRequest):
 
 
 @app.post("/auth/login")
-async def auth_login(request: TokenLoginRequest):
+async def auth_login(
+    request: TokenLoginRequest,
+    x_auth_session_id: Optional[str] = Header(default=None, alias="X-Auth-Session-Id"),
+):
     try:
-        reset_runtime_state()
-        return login_with_access_token(request.access_token, request.token_expires_on)
+        result = login_with_access_token(
+            request.access_token,
+            request.token_expires_on,
+            session_id=x_auth_session_id,
+        )
+        reset_user_runtime_state(result.get("user_email"), result.get("user_oid"))
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except Exception as exc:
@@ -335,9 +387,13 @@ async def auth_login(request: TokenLoginRequest):
 
 
 @app.post("/auth/logout")
-async def auth_logout():
-    reset_runtime_state()
-    return logout()
+async def auth_logout(
+    x_auth_session_id: Optional[str] = Header(default=None, alias="X-Auth-Session-Id"),
+):
+    session = get_authenticated_session(x_auth_session_id)
+    if session:
+        reset_user_runtime_state(session.get("user_email"), session.get("user_oid"))
+    return logout(x_auth_session_id)
 
 
 @app.get("/chat/history")

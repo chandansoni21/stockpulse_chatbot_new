@@ -1,4 +1,5 @@
 import { API_URL } from './apiConfig';
+import { apiFetch } from './apiFetch';
 import { normalizeAssistantText } from './chatErrors';
 
 function normalizeMessages(messages) {
@@ -18,7 +19,7 @@ function normalizeMessages(messages) {
   }));
 }
 export async function fetchChatHistory(agentId) {
-  const response = await fetch(`${API_URL}/chat/history?agent_id=${encodeURIComponent(agentId)}`);
+  const response = await apiFetch(`${API_URL}/chat/history?agent_id=${encodeURIComponent(agentId)}`);
   if (!response.ok) {
     throw new Error('Could not load chat history.');
   }
@@ -33,7 +34,7 @@ export async function fetchChatHistory(agentId) {
 export async function saveChatHistory(agentId, messages, backendSessionId) {
   if (!backendSessionId) return;
 
-  const response = await fetch(`${API_URL}/chat/history`, {
+  const response = await apiFetch(`${API_URL}/chat/history`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

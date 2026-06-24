@@ -3,6 +3,7 @@
 .env.local
 .env.*.local
 .auth_session.json
+.auth_sessions.json
 chat_history.db
 
 # Byte-compiled / optimized / DLL files
