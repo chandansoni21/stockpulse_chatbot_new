@@ -340,6 +340,11 @@ async def startup() -> None:
     print(f"Fabric token mode: {FABRIC_TOKEN_MODE}")
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.get("/auth/status")
 async def auth_status(
     x_auth_session_id: Optional[str] = Header(default=None, alias="X-Auth-Session-Id"),

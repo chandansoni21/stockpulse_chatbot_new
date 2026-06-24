@@ -4,6 +4,7 @@
 .env.*.local
 .auth_session.json
 .auth_sessions.json
+.auth_record.json
 chat_history.db
 
 # Byte-compiled / optimized / DLL files

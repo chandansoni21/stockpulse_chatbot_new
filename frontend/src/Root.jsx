@@ -102,6 +102,27 @@ function Root() {
     };
   }, [applyAuthStatus, checkAuth]);
 
+  useEffect(() => {
+    if (!authenticated) return undefined;
+
+    const refreshAuth = () => {
+      checkAuth().catch(() => {});
+    };
+
+    const interval = window.setInterval(refreshAuth, 45 * 60 * 1000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        refreshAuth();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [authenticated, checkAuth]);
+
   const handleLogin = async () => {
     setLoginLoading(true);
     setLoginError(null);

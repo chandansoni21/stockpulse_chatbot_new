@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: stockpulse-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: AZURE_AUTHORITY
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: TENANT_ID
+        sync: false
+      - key: FABRIC_TOKEN_MODE
+        value: delegated
+      - key: AUTH_SESSION_DAYS
+        value: "7"

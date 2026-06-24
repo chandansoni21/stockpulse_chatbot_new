@@ -119,22 +119,35 @@ def _expires_on_from_token(token_str: str) -> Optional[float]:
     return float(exp) if exp is not None else None
 
 
+def _tenant_from_token(token_str: str) -> Optional[str]:
+    claims = _decode_token_claims(token_str)
+    if not claims:
+        return None
+    tenant = claims.get("tid")
+    return str(tenant) if tenant else None
+
+
 def _session_payload(
     user_email: Optional[str] = None,
     user_oid: Optional[str] = None,
     access_token: Optional[str] = None,
     token_expires_on: Optional[float] = None,
     refresh_token: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    authenticated_at: Optional[float] = None,
 ) -> dict:
     now = time.time()
     payload: dict[str, Any] = {
-        "authenticated_at": now,
-        "expires_at": now + (SESSION_DAYS * 24 * 60 * 60),
+        "authenticated_at": authenticated_at if authenticated_at is not None else now,
+        "expires_at": expires_at if expires_at is not None else now + (SESSION_DAYS * 24 * 60 * 60),
     }
     if user_email:
         payload["user_email"] = user_email
     if user_oid:
         payload["user_oid"] = user_oid
+    if tenant_id:
+        payload["tenant_id"] = tenant_id
     if access_token:
         payload["access_token"] = access_token
     if token_expires_on:
@@ -194,19 +207,44 @@ def save_session(
     access_token: Optional[str] = None,
     token_expires_on: Optional[float] = None,
     refresh_token: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> dict:
     existing = read_session(session_id) or {}
     payload = _session_payload(
         user_email=user_email or existing.get("user_email"),
         user_oid=user_oid or existing.get("user_oid"),
+        tenant_id=tenant_id or existing.get("tenant_id"),
         access_token=access_token or existing.get("access_token"),
         token_expires_on=token_expires_on or existing.get("token_expires_on"),
         refresh_token=refresh_token or existing.get("refresh_token"),
+        expires_at=existing.get("expires_at"),
+        authenticated_at=existing.get("authenticated_at"),
     )
     sessions = _purge_expired_sessions(_read_all_sessions())
     sessions[session_id] = payload
     _write_all_sessions(sessions)
     return payload
+
+
+def update_session_tokens(
+    session_id: str,
+    access_token: str,
+    token_expires_on: float,
+    refresh_token: Optional[str] = None,
+) -> dict:
+    sessions = _purge_expired_sessions(_read_all_sessions())
+    session = sessions.get(session_id)
+    if not session:
+        raise PermissionError("Microsoft login required. Please sign in again.")
+
+    session["access_token"] = access_token
+    session["token_expires_on"] = token_expires_on
+    if refresh_token:
+        session["refresh_token"] = refresh_token
+
+    sessions[session_id] = session
+    _write_all_sessions(sessions)
+    return session
 
 
 def clear_session(session_id: Optional[str] = None) -> None:
@@ -305,42 +343,52 @@ def _access_token_valid(session: dict) -> bool:
     return bool(access_token) and time.time() < token_expires_on - 60
 
 
+def _token_endpoint(session: dict) -> str:
+    tenant = session.get("tenant_id") or AZURE_AUTHORITY
+    return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+
 def _refresh_delegated_access_token(session_id: str) -> None:
     session = read_session(session_id) or {}
     refresh_token = session.get("refresh_token")
     if not refresh_token:
+        logger.warning("Session %s has no refresh token; user must sign in again.", session_id[:8])
         raise PermissionError("Microsoft login required. Please sign in again.")
 
-    token_url = f"https://login.microsoftonline.com/{AZURE_AUTHORITY}/oauth2/v2.0/token"
-    response = requests.post(
-        token_url,
-        data={
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": f"{FABRIC_SCOPE} openid profile offline_access",
-        },
-        timeout=30,
-    )
-    payload = response.json()
-    if response.status_code >= 400:
-        error = payload.get("error_description") or payload.get("error") or "Microsoft token refresh failed."
-        raise PermissionError(error)
+    token_urls = [_token_endpoint(session)]
+    fallback_url = f"https://login.microsoftonline.com/{AZURE_AUTHORITY}/oauth2/v2.0/token"
+    if fallback_url not in token_urls:
+        token_urls.append(fallback_url)
 
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise PermissionError("Microsoft login required. Please sign in again.")
+    last_error = "Microsoft token refresh failed."
+    for token_url in token_urls:
+        response = requests.post(
+            token_url,
+            data={
+                "client_id": CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": f"{FABRIC_SCOPE} openid profile offline_access",
+            },
+            timeout=30,
+        )
+        payload = response.json()
+        if response.status_code < 400 and payload.get("access_token"):
+            expires_in = int(payload.get("expires_in", 3600))
+            expires_on = time.time() + expires_in
+            update_session_tokens(
+                session_id,
+                access_token=payload["access_token"],
+                token_expires_on=expires_on,
+                refresh_token=payload.get("refresh_token") or refresh_token,
+            )
+            logger.info("Refreshed Microsoft access token for session %s", session_id[:8])
+            return
 
-    expires_in = int(payload.get("expires_in", 3600))
-    expires_on = time.time() + expires_in
-    save_session(
-        session_id,
-        user_email=session.get("user_email"),
-        user_oid=session.get("user_oid"),
-        access_token=access_token,
-        token_expires_on=expires_on,
-        refresh_token=payload.get("refresh_token") or refresh_token,
-    )
+        last_error = payload.get("error_description") or payload.get("error") or last_error
+        logger.warning("Token refresh failed for session %s via %s: %s", session_id[:8], token_url, last_error)
+
+    raise PermissionError(last_error)
 
 
 def _ensure_delegated_access_token(session_id: str) -> dict:
@@ -421,6 +469,7 @@ def login_with_access_token(
         raise ValueError("Could not read user details from Microsoft token.")
 
     user_oid = _user_oid_from_token(access_token)
+    tenant_id = _tenant_from_token(access_token)
     expires_on = token_expires_on or _expires_on_from_token(access_token)
     if not expires_on or time.time() >= expires_on:
         raise ValueError("Microsoft token is expired. Please sign in again.")
@@ -433,7 +482,14 @@ def login_with_access_token(
         access_token=access_token,
         token_expires_on=expires_on,
         refresh_token=refresh_token,
+        tenant_id=tenant_id,
     )
+    if not refresh_token:
+        logger.warning(
+            "Login for %s did not receive a refresh token. Session will expire when the access token does (~1 hour). "
+            "Register your own Azure app with offline_access, or verify AZURE_CLIENT_ID.",
+            user_email,
+        )
     return {
         "authenticated": True,
         "expires_at": session["expires_at"],
@@ -442,6 +498,7 @@ def login_with_access_token(
         "user_email": user_email,
         "user_oid": user_oid,
         "session_id": resolved_id,
+        "refresh_available": bool(refresh_token),
         "fabric_token_mode": get_active_fabric_token_mode(),
     }
 
@@ -529,7 +586,11 @@ def get_authenticated_session(session_id: Optional[str] = None) -> Optional[dict
     if not is_session_valid(resolved_id):
         return None
 
-    session = read_session(resolved_id) or {}
+    try:
+        session = _ensure_delegated_access_token(resolved_id)
+    except PermissionError:
+        return None
+
     return {
         "user_email": session.get("user_email"),
         "user_oid": session.get("user_oid"),

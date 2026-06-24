@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/venv/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+
+# Runtime / local data
+backend/.auth_session.json
+backend/.auth_sessions.json
+backend/.auth_record.json
+backend/chat_history.db
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Build output
+frontend/dist/
+.vercel/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
